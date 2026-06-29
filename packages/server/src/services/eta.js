@@ -20,6 +20,31 @@ export function estimateHeuristic(job, { stats, jobsAhead = 0, ratePerMin = 0 } 
   };
 }
 
+export function makeBucketStatsLookup(db) {
+  const exact = db.prepare(`
+    SELECT p50_wait, p90_wait, p50_elapsed, p90_elapsed, n
+    FROM bucket_stats
+    WHERE cluster = ? AND account = ? AND partition = ? AND reason = ? AND size_bucket = ?
+  `);
+  const fallback = db.prepare(`
+    SELECT p50_wait, p90_wait, p50_elapsed, p90_elapsed, n
+    FROM bucket_stats
+    WHERE cluster = ? AND account = ? AND partition = ? AND reason = '_any' AND size_bucket = ?
+  `);
+  return (cluster, account, partition, reason, bucket) => {
+    const row = exact.get(cluster || "", account || "", partition || "", reason || "_any", bucket)
+      || fallback.get(cluster || "", account || "", partition || "", bucket)
+      || { p50_wait: 0, p90_wait: 0, p50_elapsed: 0, p90_elapsed: 0, n: 0 };
+    return {
+      p50Wait: Number(row.p50_wait) || 0,
+      p90Wait: Number(row.p90_wait) || 0,
+      p50Elapsed: Number(row.p50_elapsed) || 0,
+      p90Elapsed: Number(row.p90_elapsed) || 0,
+      n: Number(row.n) || 0,
+    };
+  };
+}
+
 // v2 placeholder. Implement event-driven backfill-aware sim later (see docs/ETA-MODEL.md).
 export function estimateSimulation() { throw new Error("simulation estimator not implemented (v2)"); }
 

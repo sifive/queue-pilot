@@ -1,6 +1,6 @@
 // Read-only slurmrestd HTTP adapter. Normalize REST job objects into the Job shape used elsewhere.
 import { config } from "../config.js";
-import { parseSlurmTime } from "@queuepilot/shared";
+import { normalizeHistoryRow, normalizeJob } from "./normalize.js";
 
 export class RestdAdapter {
   base() { return `${config.restd.url}/slurm/${config.restd.apiVersion}`; }
@@ -9,28 +9,34 @@ export class RestdAdapter {
     const t = process.env.SLURM_USER_TOKEN || "";
     return t ? { "X-SLURM-USER-TOKEN": t } : {};
   }
-  async listJobs({ cluster = config.defaultCluster } = {}) {
+  async listJobs({ cluster = config.defaultCluster, states, account, user, partition } = {}) {
     const res = await fetch(`${this.base()}/jobs`, { headers: this.headers() });
     const data = await res.json();
-    return (data.jobs || []).map((j) => this.norm(j, cluster));
+    return (data.jobs || [])
+      .map((j) => this.norm(j, cluster))
+      .filter((j) => {
+        if (states && !states.split(",").map((s) => s.trim()).includes(j.state)) return false;
+        if (account && j.account !== account) return false;
+        if (user && j.user !== user) return false;
+        if (partition && j.partition !== partition) return false;
+        return true;
+      });
   }
-  norm(j, cluster) {
-    return {
-      jobId: String(j.job_id), cluster, name: j.name, user: j.user_name, account: j.account,
-      partition: j.partition, state: Array.isArray(j.job_state) ? j.job_state[0] : j.job_state,
-      reason: j.state_reason, priority: Number(j.priority?.number ?? j.priority ?? 0),
-      pendingSeconds: 0, elapsedSeconds: 0,
-      timelimitSeconds: parseSlurmTime(j.time_limit?.number ? String(j.time_limit.number) : ""),
-      reqCpus: j.cpus?.number ?? 1, reqMem: String(j.memory_per_node?.number ?? ""),
-      wckey: j.wckey, workdir: j.current_working_directory, nodelist: j.nodes,
-    };
-  }
+  norm(j, cluster) { return normalizeJob(j, cluster); }
   async pending(args) { return (await this.listJobs(args)).filter((j) => /PENDING|PD/i.test(j.state)); }
-  async jobDetail({ jobId }) {
+  async jobDetail({ cluster = config.defaultCluster, jobId }) {
     const res = await fetch(`${this.base()}/job/${jobId}`, { headers: this.headers() });
-    return (await res.json())?.jobs?.[0] || {};
+    const job = (await res.json())?.jobs?.[0] || {};
+    return normalizeJob(job, cluster);
   }
-  async history() { return []; } // TODO: GET /slurmdb/<v>/jobs with filters.
+  async history({ cluster = config.defaultCluster, startTime } = {}) {
+    const url = new URL(`${this.dbBase()}/jobs`);
+    if (cluster) url.searchParams.set("clusters", cluster);
+    if (startTime) url.searchParams.set("start_time", startTime);
+    const res = await fetch(url, { headers: this.headers() });
+    const data = await res.json();
+    return (data.jobs || []).map((j) => normalizeHistoryRow(j, cluster));
+  }
   async fairshareAccounts() { return []; }
   clusters() { return config.clusters; }
 }

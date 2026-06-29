@@ -4,6 +4,12 @@ import { config } from "./config.js";
 export function openDb() {
   const db = new Database(config.dbPath);
   db.pragma("journal_mode = WAL");
+  const bucketStatsColumns = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='bucket_stats'").get()
+    ? db.prepare("PRAGMA table_info(bucket_stats)").all()
+    : [];
+  if (bucketStatsColumns.length > 0 && !bucketStatsColumns.some((column) => column.name === "cluster")) {
+    db.exec("DROP TABLE bucket_stats");
+  }
   db.exec(`
   CREATE TABLE IF NOT EXISTS snapshot(
     id INTEGER PRIMARY KEY, cluster TEXT, taken_at INTEGER,
@@ -21,10 +27,10 @@ export function openDb() {
   CREATE TABLE IF NOT EXISTS watch(
     id INTEGER PRIMARY KEY, owner TEXT, label TEXT, matcher_json TEXT, created_at INTEGER);
   CREATE TABLE IF NOT EXISTS bucket_stats(
-    account TEXT, partition TEXT, reason TEXT, size_bucket TEXT,
+    cluster TEXT, account TEXT, partition TEXT, reason TEXT, size_bucket TEXT,
     p50_wait INTEGER, p90_wait INTEGER, p50_elapsed INTEGER, p90_elapsed INTEGER,
     n INTEGER, updated_at INTEGER,
-    PRIMARY KEY(account, partition, reason, size_bucket));
+    PRIMARY KEY(cluster, account, partition, reason, size_bucket));
   CREATE INDEX IF NOT EXISTS idx_sample_snap ON job_sample(snapshot_id);
   CREATE INDEX IF NOT EXISTS idx_hist_bucket ON job_history(account, partition);
   `);

@@ -1,13 +1,27 @@
 import { config } from "./config.js";
 import { pressureSummary, bucketize } from "./services/queue.js";
 import { diagnoseJob, detectFanoutLogjam } from "./services/diagnostics.js";
-import { estimateHeuristic } from "./services/eta.js";
+import { estimateHeuristic, makeBucketStatsLookup } from "./services/eta.js";
 import { makeWatchlist } from "./services/watchlist.js";
 
 export function registerRoutes(app, ctx) {
   const { adapter, db } = ctx;
   const watch = makeWatchlist(db);
   const cl = (q) => q.cluster || config.defaultCluster;
+  const stats = makeBucketStatsLookup(db);
+  const etaForJob = (job, jobs) => {
+    const ahead = jobs.filter((candidate) =>
+      /^(PD|PENDING)/i.test(candidate.state) &&
+      candidate.partition === job.partition &&
+      candidate.jobId !== job.jobId &&
+      candidate.priority > job.priority
+    ).length;
+    return estimateHeuristic(job, {
+      stats: (account, partition, reason, bucket) => stats(job.cluster, account, partition, reason, bucket),
+      jobsAhead: ahead,
+      ratePerMin: 0,
+    });
+  };
 
   app.get("/api/clusters", async () => ({ clusters: adapter.clusters(), default: config.defaultCluster }));
 
@@ -29,7 +43,7 @@ export function registerRoutes(app, ctx) {
     const jobs = await adapter.listJobs({ cluster, states: "PD,R" });
     const job = jobs.find((j) => j.jobId === req.params.id) || (await adapter.jobDetail({ cluster, jobId: req.params.id }));
     if (!job || !job.jobId) return { error: "not found" };
-    return { job, diagnosis: diagnoseJob(job), eta: estimateHeuristic(job, { jobsAhead: 0, ratePerMin: 0 }) };
+    return { job, diagnosis: diagnoseJob(job), eta: etaForJob(job, jobs) };
   });
 
   app.get("/api/diagnose", async (req) => {
@@ -49,8 +63,7 @@ export function registerRoutes(app, ctx) {
     const jobs = await adapter.listJobs({ cluster, states: "PD,R" });
     const job = jobs.find((j) => j.jobId === req.params.id);
     if (!job) return { error: "not found" };
-    const ahead = jobs.filter((j) => /^(PD|PENDING)/i.test(j.state) && j.partition === job.partition && j.priority > job.priority).length;
-    return estimateHeuristic(job, { jobsAhead: ahead, ratePerMin: 0 });
+    return etaForJob(job, jobs);
   });
 
   app.get("/api/watch", async (req) => ({ items: watch.list(req.query.owner || "me") }));
@@ -64,7 +77,7 @@ export function registerRoutes(app, ctx) {
     const jobs = await adapter.listJobs({ cluster, states: "PD,R" });
     const mine = watch.resolve(jobs, item.matcher);
     return {
-      item, jobs: mine.map((j) => ({ job: j, diagnosis: diagnoseJob(j), eta: estimateHeuristic(j) })),
+      item, jobs: mine.map((j) => ({ job: j, diagnosis: diagnoseJob(j), eta: etaForJob(j, jobs) })),
       logjams: detectFanoutLogjam(jobs).filter((l) => mine.some((m) => l.childJobIds.includes(m.jobId) || l.parentJobId === m.jobId)),
     };
   });
