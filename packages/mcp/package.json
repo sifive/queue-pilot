@@ -1,0 +1,11 @@
+{
+  "name": "@queuepilot/mcp",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": { "queuepilot-mcp": "src/server.js" },
+  "scripts": { "dev": "node src/server.js" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@queuepilot/shared": "*"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "queuepilot",
+  "private": true,
+  "version": "0.1.0",
+  "description": "QueuePilot - triage and model queue pressure on the SiFive Slurm/Jenkins EDA job farm (Web UI + REST/WS + MCP).",
+  "workspaces": ["packages/shared", "packages/server", "packages/mcp", "packages/web"],
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "dev": "SLURM_ADAPTER=mock npm -w packages/server run dev",
+    "dev:web": "npm -w packages/web run dev",
+    "dev:mcp": "npm -w packages/mcp run dev",
+    "start": "npm -w packages/server run start",
+    "build": "npm -w packages/web run build",
+    "test": "node --test packages/shared packages/server"
+  }
+}
