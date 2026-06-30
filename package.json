@@ -6,7 +6,8 @@
   "workspaces": ["packages/shared", "packages/server", "packages/mcp", "packages/web"],
   "engines": { "node": ">=20" },
   "scripts": {
-    "dev": "SLURM_ADAPTER=mock npm -w packages/server run dev",
+    "dev": "npm -w packages/server run dev",
+    "dev:mock": "SLURM_ADAPTER=mock npm -w packages/server run dev",
     "dev:web": "npm -w packages/web run dev",
     "dev:mcp": "npm -w packages/mcp run dev",
     "start": "npm -w packages/server run start",

@@ -21,7 +21,9 @@ function run(bin, args) {
     // Persistent connection recommended: configure ControlMaster in ~/.ssh/config for the host.
     const target = config.ssh.user ? `${config.ssh.user}@${config.ssh.host}` : config.ssh.host;
     cmd = "ssh";
-    cmdArgs = ["-o", "BatchMode=yes", target, [bin, ...args].map(shq).join(" ")];
+    cmdArgs = ["-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes"];
+    if (config.ssh.key) cmdArgs.push("-i", config.ssh.key);
+    cmdArgs.push(target, [bin, ...args].map(shq).join(" "));
   }
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, cmdArgs, { stdio: ["ignore", "pipe", "pipe"] });

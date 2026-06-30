@@ -1,10 +1,17 @@
+import { existsSync } from "node:fs";
+
+const envFile = new URL("../../../.env", import.meta.url);
+if (typeof process.loadEnvFile === "function" && existsSync(envFile)) {
+  process.loadEnvFile(envFile);
+}
+
 const env = process.env;
 export const config = {
   port: Number(env.PORT || 8080),
   adapter: env.SLURM_ADAPTER || "cli",
   clusters: (env.SLURM_CLUSTERS || "compute1,testbed,primo").split(",").map((s) => s.trim()),
   defaultCluster: env.SLURM_DEFAULT_CLUSTER || "compute1",
-  ssh: { host: env.SLURM_SSH_HOST || "", user: env.SLURM_SSH_USER || "" },
+  ssh: { host: env.SLURM_SSH_HOST || "", user: env.SLURM_SSH_USER || "", key: env.SLURM_SSH_KEY || "" },
   restd: { url: env.SLURMRESTD_URL || "", apiVersion: env.SLURMRESTD_API_VERSION || "v0.0.42" },
   pollSeconds: Math.max(10, Number(env.SLURM_POLL_SECONDS || 30)),
   historyDays: Number(env.HISTORY_RETENTION_DAYS || 30),

@@ -27,10 +27,11 @@ It ships with a **Web UI**, a **REST + WebSocket API**, and an **MCP server** so
 ```
 cp .env.example .env
 npm install
-npm run dev          # starts the API with SLURM_ADAPTER=mock
+npm run dev:mock     # starts the API with SLURM_ADAPTER=mock
 npm run dev:web      # in another shell - the dashboard
 ```
-Point at a real farm by setting `SLURM_ADAPTER=cli` and `SLURM_SSH_HOST=<login node>` (read-only).
+For real-farm reads, set `SLURM_ADAPTER=cli` and `SLURM_SSH_HOST=<login node>` in `.env`, then use
+`npm run dev`.
 
 ## For the implementing agent
 Read **AGENTS.md** first - it is the authoritative build spec, with the exact Slurm commands,
