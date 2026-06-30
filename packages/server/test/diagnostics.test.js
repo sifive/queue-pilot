@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { MockAdapter } from "../src/slurm/mock.js";
-import { buildDiagnosticsDataset, detectFanoutLogjam, diagnoseJob, parseDependencyIds } from "../src/services/diagnostics.js";
+import { buildDiagnosticsDataset, buildDiagnosticsView, detectFanoutLogjam, diagnoseJob, parseDependencyIds } from "../src/services/diagnostics.js";
 
 test("fan-out detector finds pending children behind a running parent", async () => {
   const adapter = new MockAdapter();
@@ -51,4 +51,60 @@ test("diagnostics dataset groups jobs by flow and exposes blockers", async () =>
   assert.equal(dependentJob.blockerSource, "dependency");
   assert.equal(flowGroup.pendingCount, 2);
   assert.deepEqual(flowGroup.originParentIds, ["60000001", "60000002"]);
+});
+
+test("logjam view annotates external queue pressure from other flows", async () => {
+  const adapter = new MockAdapter();
+  const jobs = await adapter.listJobs({ states: "PD,R" });
+  jobs.push(
+    {
+      jobId: "70000001",
+      cluster: jobs[0].cluster,
+      name: "other-flow-ahead-1",
+      user: "jenkins-verif",
+      account: "verif_bulk",
+      partition: "standard_scl",
+      state: "PD",
+      reason: "Priority",
+      priority: 8000,
+      pendingSeconds: 1200,
+      elapsedSeconds: 0,
+      timelimitSeconds: 3600,
+      reqCpus: 1,
+      reqMem: "4G",
+      wckey: ":other-flow-a/",
+      workdir: "/scratch/jenkins/archived-builds/other-flow-a/builds/run-a",
+      nodelist: "",
+      dependency: "",
+    },
+    {
+      jobId: "70000002",
+      cluster: jobs[0].cluster,
+      name: "other-flow-ahead-2",
+      user: "jenkins-verif",
+      account: "verif_bulk",
+      partition: "standard_scl",
+      state: "PD",
+      reason: "Priority",
+      priority: 7000,
+      pendingSeconds: 900,
+      elapsedSeconds: 0,
+      timelimitSeconds: 3600,
+      reqCpus: 1,
+      reqMem: "4G",
+      wckey: ":other-flow-b/",
+      workdir: "/scratch/jenkins/archived-builds/other-flow-b/builds/run-b",
+      nodelist: "",
+      dependency: "",
+    }
+  );
+
+  const logjamView = buildDiagnosticsView(jobs, { section: "logjams", sampleLimit: 6 });
+  const [logjam] = logjamView.data.items;
+
+  assert.equal(logjam.externalQueuePressure.aheadJobs, 3);
+  assert.equal(logjam.externalQueuePressure.externalFlows, 3);
+  assert.ok(logjam.externalQueuePressure.drainHours > 0);
+  assert.equal(logjam.runningParents[0].externalQueuePressure.aheadJobs, 3);
+  assert.match(logjam.message, /higher-priority job\(s\) from other flows ahead in queue/);
 });

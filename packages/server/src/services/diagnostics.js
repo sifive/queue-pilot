@@ -12,10 +12,63 @@ const byCount = (a, b) => (b.pendingCount || b.runningCount || b.jobCount || 0) 
 const DEFAULT_JOB_LIMIT = 200;
 const DEFAULT_GRAPH_SAMPLE_LIMIT = 8;
 const NULLISH_FLOW_VALUES = new Set(["", "(null)", "null", "none", "/root"]);
+const DEFAULT_DRAIN_SLICE_SECONDS = 1800;
+const MAX_DRAIN_SLICE_SECONDS = 4 * 3600;
 
 function avg(values) {
   if (values.length === 0) return 0;
   return Math.round((values.reduce((sum, value) => sum + value, 0) / values.length) * 10) / 10;
+}
+
+function mean(values) {
+  if (values.length === 0) return 0;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function flowIdentity(job) {
+  return job.flowKey || `job:${job.jobId}`;
+}
+
+function flowLabelForJob(job) {
+  return job.wckey || job.flowKey || job.workdirRoot || `Job ${job.jobId}`;
+}
+
+function estimateDrainSliceSeconds(job) {
+  const remaining = Math.max(0, (job.timelimitSeconds || 0) - (job.elapsedSeconds || 0));
+  const observed = Math.max(job.elapsedSeconds || 0, DEFAULT_DRAIN_SLICE_SECONDS);
+  const estimate = remaining || observed;
+  return Math.max(900, Math.min(estimate, MAX_DRAIN_SLICE_SECONDS));
+}
+
+function countAheadFlows(jobs = []) {
+  const byFlow = new Map();
+  for (const job of jobs) {
+    const key = flowIdentity(job);
+    if (!byFlow.has(key)) {
+      byFlow.set(key, {
+        flowKey: key,
+        label: flowLabelForJob(job),
+        partition: job.partition || "",
+        count: 0,
+      });
+    }
+    byFlow.get(key).count += 1;
+  }
+  return [...byFlow.values()]
+    .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+}
+
+function summarizeQueuePressure(queuePressure) {
+  if (!queuePressure) return null;
+  return {
+    partition: queuePressure.partition || "",
+    aheadJobs: queuePressure.aheadJobs || 0,
+    externalFlows: queuePressure.externalFlows || 0,
+    drainSeconds: queuePressure.drainSeconds || 0,
+    drainHours: roundHours(queuePressure.drainSeconds || 0),
+    topFlows: (queuePressure.topFlows || []).slice(0, 4),
+    partitions: queuePressure.partitions || [],
+  };
 }
 
 function reasonMixFor(jobs) {
@@ -27,7 +80,7 @@ function reasonMixFor(jobs) {
   return mix;
 }
 
-function summarizeJob(job) {
+function summarizeJob(job, extra = {}) {
   return {
     jobId: job.jobId,
     name: job.name,
@@ -40,6 +93,7 @@ function summarizeJob(job) {
     workdir: job.workdir,
     waitHours: job.waitHours,
     elapsedHours: job.elapsedHours,
+    ...extra,
   };
 }
 
@@ -208,6 +262,14 @@ function pageSummary(groups, jobs, mode) {
 }
 
 function serializeLogjam(group, jobsById, sampleLimit = DEFAULT_GRAPH_SAMPLE_LIMIT) {
+  const parentQueuePressure = new Map((group.parentQueuePressure || []).map((pressure) => [String(pressure.jobId), pressure]));
+  const summarizeParentWithPressure = (jobId) => {
+    const job = jobsById.get(String(jobId));
+    if (!job) return null;
+    return summarizeJob(job, {
+      externalQueuePressure: summarizeQueuePressure(parentQueuePressure.get(String(jobId)) || group.externalQueuePressure),
+    });
+  };
   return {
     flowKey: group.flowKey,
     label: group.label,
@@ -217,10 +279,13 @@ function serializeLogjam(group, jobsById, sampleLimit = DEFAULT_GRAPH_SAMPLE_LIM
     runningCount: group.runningCount,
     maxWaitHours: group.maxWaitHours,
     reasonMix: group.reasonMix,
-    originParents: group.originParents,
-    runningParents: graphJobSamples(group.runningJobIds, jobsById, sampleLimit),
+    originParents: uniq(group.originParentIds).map(summarizeParentWithPressure).filter(Boolean),
+    runningParents: group.runningJobIds.map(summarizeParentWithPressure).filter(Boolean),
     children: graphJobSamples(group.pendingJobIds, jobsById, sampleLimit),
-    message: `Flow ${group.label} has ${group.runningCount} active parent run(s) with ${group.pendingCount} pending child job(s).`,
+    externalQueuePressure: summarizeQueuePressure(group.externalQueuePressure),
+    message: group.externalQueuePressure?.aheadJobs
+      ? `Flow ${group.label} has ${group.runningCount} active parent run(s), ${group.pendingCount} pending child job(s), and ${group.externalQueuePressure.aheadJobs} higher-priority job(s) from other flows ahead in queue.`
+      : `Flow ${group.label} has ${group.runningCount} active parent run(s) with ${group.pendingCount} pending child job(s).`,
     isControlPlane: isControlPlaneGroup(group),
   };
 }
@@ -314,6 +379,7 @@ export function annotateJobs(jobs) {
 function buildFlowGroups(annotatedJobs) {
   const byId = new Map(annotatedJobs.map((job) => [String(job.jobId), job]));
   const grouped = new Map();
+  const byPartition = new Map();
 
   for (const job of annotatedJobs) {
     const key = job.flowKey || `job:${job.jobId}`;
@@ -338,6 +404,12 @@ function buildFlowGroups(annotatedJobs) {
     if (job.user) group.users.add(job.user);
     if (job.account) group.accounts.add(job.account);
     if (job.partition) group.partitions.add(job.partition);
+    if (!byPartition.has(job.partition || "")) {
+      byPartition.set(job.partition || "", { pending: [], running: [] });
+    }
+    const lane = byPartition.get(job.partition || "");
+    if (job.isPending) lane.pending.push(job);
+    if (job.isRunning) lane.running.push(job);
   }
 
   return [...grouped.values()].map((group) => {
@@ -350,6 +422,55 @@ function buildFlowGroups(annotatedJobs) {
     const originParents = originParentIds.map((id) => byId.get(String(id))).filter(Boolean).map(summarizeJob);
     const pendingHours = pendingJobs.map((job) => job.waitHours);
     const elapsedHours = runningJobs.map((job) => job.elapsedHours);
+    const partitionQueuePressure = [...new Set(pendingJobs.map((job) => job.partition).filter(Boolean))]
+      .map((partition) => {
+        const lane = byPartition.get(partition) || { pending: [], running: [] };
+        const minPriority = Math.min(...pendingJobs.filter((job) => job.partition === partition).map((job) => Number(job.priority) || 0));
+        const aheadJobs = lane.pending.filter((job) =>
+          flowIdentity(job) !== group.flowKey &&
+          (Number(job.priority) || 0) > minPriority
+        );
+        const servicePool = lane.running.length ? lane.running : annotatedJobs.filter((job) => job.isRunning);
+        const drainSliceSeconds = mean(servicePool.map(estimateDrainSliceSeconds));
+        const topFlows = countAheadFlows(aheadJobs);
+        return {
+          partition,
+          aheadJobs: aheadJobs.length,
+          aheadJobIds: aheadJobs.map((job) => job.jobId),
+          externalFlows: topFlows.length,
+          drainSeconds: aheadJobs.length && drainSliceSeconds
+            ? Math.round((aheadJobs.length / Math.max(1, servicePool.length || 1)) * drainSliceSeconds)
+            : 0,
+          topFlows,
+        };
+      })
+      .filter((pressure) => pressure.aheadJobs > 0)
+      .sort((a, b) => b.aheadJobs - a.aheadJobs || b.drainSeconds - a.drainSeconds);
+    const combinedAheadIds = uniq(partitionQueuePressure.flatMap((pressure) => pressure.aheadJobIds));
+    const combinedTopFlows = countAheadFlows(
+      combinedAheadIds
+        .map((jobId) => byId.get(String(jobId)))
+        .filter(Boolean)
+    );
+    const externalQueuePressure = {
+      partition: partitionQueuePressure.length === 1 ? partitionQueuePressure[0].partition : "",
+      aheadJobs: combinedAheadIds.length,
+      externalFlows: combinedTopFlows.length,
+      drainSeconds: partitionQueuePressure.length ? Math.max(...partitionQueuePressure.map((pressure) => pressure.drainSeconds)) : 0,
+      topFlows: combinedTopFlows,
+      partitions: partitionQueuePressure.map((pressure) => pressure.partition),
+    };
+    const parentQueuePressure = uniq([...originParentIds, ...group.runningJobIds])
+      .map((jobId) => byId.get(String(jobId)))
+      .filter(Boolean)
+      .map((job) => {
+        const partitionPressure = partitionQueuePressure.find((pressure) => pressure.partition === job.partition);
+        return {
+          jobId: job.jobId,
+          ...(partitionPressure || externalQueuePressure),
+          partition: partitionPressure?.partition || job.partition || "",
+        };
+      });
     return {
       flowKey: group.flowKey,
       label: group.label,
@@ -371,6 +492,9 @@ function buildFlowGroups(annotatedJobs) {
       jobIds: group.jobIds,
       pendingJobIds: group.pendingJobIds,
       runningJobIds: group.runningJobIds,
+      externalQueuePressure,
+      partitionQueuePressure,
+      parentQueuePressure,
       users: [...group.users].sort(),
       accounts: [...group.accounts].sort(),
       partitions: [...group.partitions].sort(),

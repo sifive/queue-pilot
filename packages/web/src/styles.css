@@ -516,6 +516,11 @@ select {
   border-color: rgba(59, 130, 246, 0.24);
 }
 
+.flow-tree-node.tone-queue {
+  background: linear-gradient(135deg, rgba(238, 242, 255, 0.98), rgba(255, 255, 255, 0.96));
+  border-color: rgba(79, 70, 229, 0.24);
+}
+
 .flow-tree-node.tone-blocked {
   background: linear-gradient(135deg, rgba(254, 242, 242, 0.98), rgba(255, 255, 255, 0.96));
   border-color: rgba(239, 68, 68, 0.2);

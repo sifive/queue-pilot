@@ -36,10 +36,35 @@ function tokenizeFlow(group) {
   return tags;
 }
 
+function fmtDrainHours(hours = 0) {
+  if (!hours) return "clear";
+  return `${hours.toFixed(hours >= 10 ? 0 : 1)}h`;
+}
+
+function queuePressureSummary(queuePressure) {
+  if (!queuePressure?.aheadJobs) return "No other-flow queue pressure detected";
+  const flowLabel = queuePressure.externalFlows ? ` across ${queuePressure.externalFlows} flow${queuePressure.externalFlows === 1 ? "" : "s"}` : "";
+  return `${queuePressure.aheadJobs} higher-priority job${queuePressure.aheadJobs === 1 ? "" : "s"} ahead${flowLabel}`;
+}
+
+function queuePressureBadges(queuePressure) {
+  if (!queuePressure?.aheadJobs) return ["Queue clear"];
+  return [
+    `${queuePressure.aheadJobs} ahead`,
+    queuePressure.drainHours ? `~${fmtDrainHours(queuePressure.drainHours)} drain` : `${queuePressure.externalFlows || 0} ext flows`,
+  ];
+}
+
 function summarizeJobs(items = [], limit = 4) {
   return items.slice(0, limit).map((item) => ({
     label: `${item.jobId} ${item.name || ""}`.trim(),
-    meta: [item.state, item.user, item.account].filter(Boolean).join(" / "),
+    meta: [
+      item.state,
+      item.user,
+      item.account,
+      item.externalQueuePressure?.aheadJobs ? `${item.externalQueuePressure.aheadJobs} ahead` : "",
+      item.externalQueuePressure?.drainHours ? `~${fmtDrainHours(item.externalQueuePressure.drainHours)} drain` : "",
+    ].filter(Boolean).join(" / "),
   }));
 }
 
@@ -90,20 +115,34 @@ function buildGraphModel(mode, group) {
   });
 
   if (mode === "logjam") {
+    const pressure = group.externalQueuePressure;
     const originNode = makeNode({
       title: "Origin Runs",
       subtitle: compactLabels((group.originParents || []).map((item) => item.jobId)),
       tone: "origin",
-      badges: [`${(group.originParents || []).length} parent run${(group.originParents || []).length === 1 ? "" : "s"}`],
+      badges: [
+        `${(group.originParents || []).length} parent run${(group.originParents || []).length === 1 ? "" : "s"}`,
+        pressure?.aheadJobs ? `${pressure.aheadJobs} ext ahead` : null,
+      ].filter(Boolean),
       items: summarizeJobs(group.originParents || []),
+    });
+    const queueNode = makeNode({
+      title: "External Queue",
+      subtitle: queuePressureSummary(pressure),
+      tone: "queue",
+      badges: queuePressureBadges(pressure),
+      items: (pressure?.topFlows || []).map((flow) => ({
+        label: flow.label,
+        meta: [`${flow.count} ahead`, flow.partition].filter(Boolean).join(" / "),
+      })),
     });
     const runningNode = makeNode({
       title: "Active Runners",
-      subtitle: compactLabels((group.runningParents || []).map((item) => item.jobId)),
+      subtitle: pressure?.aheadJobs ? `${compactLabels((group.runningParents || []).map((item) => item.jobId))} · ~${fmtDrainHours(pressure.drainHours)} est drain` : compactLabels((group.runningParents || []).map((item) => item.jobId)),
       tone: "running",
-      badges: [`${group.runningCount || 0} running`],
+      badges: [`${group.runningCount || 0} running`, pressure?.aheadJobs ? `${pressure.aheadJobs} ahead` : null].filter(Boolean),
       items: summarizeJobs(group.runningParents || []),
-      children: reasonNodes(group),
+      children: [queueNode, ...reasonNodes(group)],
     });
     originNode.children = [runningNode];
     flowRoot.children = [originNode];
