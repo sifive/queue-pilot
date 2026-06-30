@@ -3,13 +3,15 @@ import { api } from "./api.js";
 
 const PAGE_META = {
   pressure: { label: "Pressure", kicker: "Queue posture", title: "Cluster pressure by account and partition" },
-  logjams: { label: "Logjams", kicker: "True blockers", title: "Trace running parents to the pending jobs they are holding up" },
-  pending: { label: "Pending", kicker: "Waiting traffic", title: "See who has been waiting the longest and which parents are in the way" },
-  running: { label: "Running", kicker: "Active traffic", title: "Aggregate currently running jobs by WCKey and execution flow" },
-  watchlist: { label: "Watchlist", kicker: "Jobs of interest", title: "Track saved job matchers with live ETA and diagnosis context" },
+  logjams: { label: "Logjams", kicker: "True blockers", title: "Trace the flows where running parents are holding pending work behind them" },
+  pending: { label: "Pending", kicker: "Waiting traffic", title: "Search and inspect pending jobs without loading the entire farm into the browser" },
+  running: { label: "Running", kicker: "Active traffic", title: "Inspect currently running flows with aggregated graph and paged list views" },
+  watchlist: { label: "Watchlist", kicker: "Jobs of interest", title: "Track saved job matchers with ETA and diagnosis context" },
 };
 
 const PAGE_ORDER = ["pressure", "logjams", "pending", "running", "watchlist"];
+const GRAPH_GROUP_LIMIT = 32;
+const LIST_JOB_LIMIT = 200;
 const REASON_COLORS = {
   priority: "#0f766e",
   resources: "#b45309",
@@ -44,65 +46,42 @@ const fmtHours = (hours) => `${Number(hours || 0).toFixed(hours >= 10 ? 0 : 1)}h
 const fmtRatio = (value) => Number(value || 0).toFixed(2);
 const text = (value) => String(value || "").trim();
 const wckeyLabel = (value) => text(value) || "No WCKey";
-const jobFlowLabel = (job) => wckeyLabel(job.wckey || job.flowKey || job.workdirRoot);
 
 function groupJobsByFlow(jobs) {
   const groups = new Map();
   for (const job of jobs) {
-    const key = job.flowKey || `job:${job.jobId}`;
+    const key = job.flowKey || job.wckey || job.workdirRoot || `job:${job.jobId}`;
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(job);
   }
   return [...groups.entries()].map(([key, items]) => ({
     key,
-    label: jobFlowLabel(items[0]),
-    items: [...items].sort((a, b) => (b.pendingSeconds || b.elapsedSeconds || 0) - (a.pendingSeconds || a.elapsedSeconds || 0)),
+    label: wckeyLabel(items[0]?.wckey || items[0]?.flowKey || items[0]?.workdirRoot),
+    items: [...items].sort((a, b) => (b.waitHours || b.elapsedHours || 0) - (a.waitHours || a.elapsedHours || 0)),
   })).sort((a, b) => b.items.length - a.items.length || a.label.localeCompare(b.label));
 }
 
-function searchBlobForJob(job) {
-  return [
-    job.jobId,
-    job.name,
-    job.user,
-    job.account,
-    job.partition,
-    job.state,
-    job.reason,
-    job.wckey,
-    job.flowKey,
-    job.workdir,
-    job.dependency,
-    ...(job.blockerIds || []),
-    ...(job.originParentIds || []),
-  ].join(" ").toLowerCase();
+function relativeSnapshot(takenAt) {
+  if (!takenAt) return "No cached snapshot";
+  const diff = Math.max(0, Math.floor(Date.now() / 1000) - Number(takenAt));
+  if (diff < 60) return `Snapshot ${diff}s ago`;
+  if (diff < 3600) return `Snapshot ${Math.floor(diff / 60)}m ago`;
+  return `Snapshot ${Math.floor(diff / 3600)}h ago`;
 }
 
-function matchesJob(job, searchTerm) {
-  if (!job) return false;
-  if (!searchTerm) return true;
-  return searchBlobForJob(job).includes(searchTerm);
-}
-
-function matchesGroup(group, searchTerm, jobsById) {
-  if (!searchTerm) return true;
-  const direct = [
-    group.label,
-    group.flowKey,
-    group.wckey,
-    group.workdirRoot,
-    ...group.users,
-    ...group.accounts,
-    ...group.partitions,
-    ...group.blockers.map((parent) => `${parent.jobId} ${parent.name}`),
-    ...group.originParents.map((parent) => `${parent.jobId} ${parent.name}`),
-  ].join(" ").toLowerCase();
-  if (direct.includes(searchTerm)) return true;
-  return (group.jobIds || []).some((jobId) => matchesJob(jobsById[jobId], searchTerm));
-}
-
-function reasonMixEntries(reasonMix = {}) {
-  return Object.entries(reasonMix).sort((a, b) => b[1] - a[1]);
+function pageDetail(page, data, view) {
+  if (!data) return "Loading...";
+  if (page === "pressure") return relativeSnapshot(data.snapshotTakenAt);
+  if (page === "logjams") return `Showing ${data.data?.shown || 0} of ${data.data?.total || 0} logjams`;
+  if (page === "pending" || page === "running") {
+    if (view === "list") {
+      const start = (data.data?.offset || 0) + 1;
+      const end = Math.min((data.data?.offset || 0) + (data.data?.items?.length || 0), data.data?.total || 0);
+      return `Jobs ${data.data?.total ? `${start}-${end}` : "0"} of ${data.data?.total || 0}`;
+    }
+    return `Showing ${data.data?.shown || 0} of ${data.data?.total || 0} flows`;
+  }
+  return "Ready";
 }
 
 export default function App() {
@@ -110,14 +89,18 @@ export default function App() {
   const [clusters, setClusters] = useState(["compute1"]);
   const [page, setPage] = useState(readPage());
   const [pressure, setPressure] = useState(null);
-  const [triage, setTriage] = useState(null);
+  const [summary, setSummary] = useState(null);
+  const [sectionData, setSectionData] = useState(null);
   const [watchItems, setWatchItems] = useState([]);
   const [watchStatuses, setWatchStatuses] = useState({});
   const [search, setSearch] = useState("");
   const [pendingView, setPendingView] = useState("graph");
   const [runningView, setRunningView] = useState("graph");
-  const [loading, setLoading] = useState(false);
-  const deferredSearch = useDeferredValue(search.trim().toLowerCase());
+  const [jobOffsets, setJobOffsets] = useState({ pending: 0, running: 0 });
+  const [loadingSummary, setLoadingSummary] = useState(false);
+  const [loadingSection, setLoadingSection] = useState(false);
+  const deferredSearch = useDeferredValue(search.trim());
+  const currentView = page === "pending" ? pendingView : page === "running" ? runningView : "graph";
 
   useEffect(() => {
     api.clusters().then((data) => {
@@ -134,22 +117,58 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    setJobOffsets({ pending: 0, running: 0 });
+  }, [cluster, deferredSearch, pendingView, runningView]);
+
+  useEffect(() => {
     if (!cluster) return;
-    let cancelled = false;
-    setLoading(true);
-    Promise.all([api.pressure(cluster), api.diagnose(cluster)])
-      .then(([pressureData, triageData]) => {
-        if (cancelled) return;
+    const controller = new AbortController();
+    setLoadingSummary(true);
+    Promise.all([
+      api.pressure(cluster, { signal: controller.signal }),
+      api.diagnose(cluster, { section: "summary" }, { signal: controller.signal }),
+    ])
+      .then(([pressureData, summaryData]) => {
         setPressure(pressureData);
-        setTriage(triageData);
+        setSummary(summaryData);
       })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
+      .catch((error) => {
+        if (error.name !== "AbortError") throw error;
+      })
+      .finally(() => setLoadingSummary(false));
+    return () => controller.abort();
   }, [cluster]);
+
+  useEffect(() => {
+    if (!cluster || page === "pressure" || page === "watchlist") {
+      setSectionData(null);
+      return;
+    }
+    const controller = new AbortController();
+    const query = { section: page, search: deferredSearch };
+    if (page === "logjams") {
+      query.groupLimit = GRAPH_GROUP_LIMIT;
+      query.sampleLimit = 6;
+    }
+    if (page === "pending" || page === "running") {
+      query.view = currentView;
+      if (currentView === "graph") {
+        query.groupLimit = GRAPH_GROUP_LIMIT;
+        query.sampleLimit = 6;
+      } else {
+        query.jobLimit = LIST_JOB_LIMIT;
+        query.jobOffset = jobOffsets[page];
+      }
+    }
+    setLoadingSection(true);
+    api.diagnose(cluster, query, { signal: controller.signal })
+      .then((data) => setSectionData(data))
+      .catch((error) => {
+        if (error.name !== "AbortError") throw error;
+      })
+      .finally(() => setLoadingSection(false));
+    return () => controller.abort();
+  }, [cluster, page, currentView, deferredSearch, jobOffsets]);
 
   useEffect(() => {
     if (page !== "watchlist") return;
@@ -158,9 +177,7 @@ export default function App() {
       if (cancelled) return;
       setWatchItems(result.items);
       const statuses = {};
-      for (const item of result.items) {
-        statuses[item.id] = await api.watchStatus(item.id);
-      }
+      for (const item of result.items) statuses[item.id] = await api.watchStatus(item.id);
       if (!cancelled) setWatchStatuses(statuses);
     });
     return () => {
@@ -168,19 +185,12 @@ export default function App() {
     };
   }, [page, cluster]);
 
-  const jobsById = Object.fromEntries((triage?.jobs || []).map((job) => [job.jobId, job]));
-  const filteredJobs = (triage?.jobs || []).filter((job) => matchesJob(job, deferredSearch));
-  const filteredLogjams = (triage?.logjams?.items || []).filter((group) => matchesGroup(group, deferredSearch, jobsById));
-  const filteredPendingGroups = (triage?.pending?.groups || []).filter((group) => matchesGroup(group, deferredSearch, jobsById));
-  const filteredRunningGroups = (triage?.running?.groups || []).filter((group) => matchesGroup(group, deferredSearch, jobsById));
-  const filteredPendingJobs = filteredJobs.filter((job) => job.isPending);
-  const filteredRunningJobs = filteredJobs.filter((job) => job.isRunning);
-
   const currentPage = PAGE_META[page] || PAGE_META.pressure;
   const navigate = (nextPage) => {
     startTransition(() => setPage(nextPage));
     window.location.hash = nextPage;
   };
+  const snapshotTakenAt = sectionData?.snapshotTakenAt || summary?.snapshotTakenAt || pressure?.snapshotTakenAt;
 
   return (
     <div className="app-shell">
@@ -189,7 +199,7 @@ export default function App() {
       <header className="hero">
         <div>
           <div className="hero-kicker">QueuePilot / EDA Queue Triage</div>
-          <h1>Readable flow traces for crowded Slurm farms.</h1>
+          <h1>Faster pages, smaller payloads, clearer blockers.</h1>
           <p>{currentPage.title}</p>
         </div>
         <div className="hero-controls">
@@ -199,32 +209,32 @@ export default function App() {
               {clusters.map((value) => <option key={value}>{value}</option>)}
             </select>
           </label>
-          <label className="search-box">
-            <span>Search jobs, WCKey, blocker, workdir</span>
-            <input
-              value={search}
-              onChange={(event) => setSearch(event.target.value)}
-              placeholder="e.g. 60000110, :post-compile/, /scratch/jenkins"
-            />
-          </label>
+          {page !== "pressure" && page !== "watchlist" ? (
+            <label className="search-box">
+              <span>Server-side search</span>
+              <input
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                placeholder="job id, WCKey, blocker, workdir, user, account"
+              />
+            </label>
+          ) : (
+            <div className="detail-chip hero-chip">{relativeSnapshot(snapshotTakenAt)}</div>
+          )}
         </div>
       </header>
 
       <section className="summary-strip">
-        <StatCard label="Pending" value={triage?.summary?.pendingCount ?? pressure?.pendingCount ?? 0} tone="warm" />
-        <StatCard label="Running" value={triage?.summary?.runningCount ?? pressure?.runningCount ?? 0} tone="cool" />
-        <StatCard label="Logjams" value={triage?.summary?.logjamCount ?? 0} tone="danger" />
-        <StatCard label="Filtered Jobs" value={filteredJobs.length} tone="neutral" />
-        <StatCard label="Queue Ratio" value={fmtRatio(pressure?.runningCount ? pressure.pendingCount / pressure.runningCount : pressure?.pendingCount || 0)} tone="cool" />
+        <StatCard label="Pending" value={summary?.summary?.pendingCount ?? pressure?.pendingCount ?? 0} tone="warm" />
+        <StatCard label="Running" value={summary?.summary?.runningCount ?? pressure?.runningCount ?? 0} tone="cool" />
+        <StatCard label="Logjams" value={summary?.summary?.logjamCount ?? 0} tone="danger" />
+        <StatCard label="Flows" value={summary?.summary?.uniqueFlows ?? 0} tone="neutral" />
+        <StatCard label="Snapshot" value={relativeSnapshot(snapshotTakenAt).replace("Snapshot ", "")} tone="cool" />
       </section>
 
       <nav className="top-nav">
         {PAGE_ORDER.map((item) => (
-          <button
-            key={item}
-            className={item === page ? "nav-pill active" : "nav-pill"}
-            onClick={() => navigate(item)}
-          >
+          <button key={item} className={item === page ? "nav-pill active" : "nav-pill"} onClick={() => navigate(item)}>
             <span>{PAGE_META[item].label}</span>
             <small>{PAGE_META[item].kicker}</small>
           </button>
@@ -232,26 +242,32 @@ export default function App() {
       </nav>
 
       <main className="page-shell">
-        <PageHeader kicker={currentPage.kicker} title={currentPage.title} detail={loading ? "Refreshing..." : `${filteredJobs.length} matching jobs in view`} />
+        <PageHeader
+          kicker={currentPage.kicker}
+          title={currentPage.title}
+          detail={loadingSummary || loadingSection ? "Refreshing..." : pageDetail(page, page === "pressure" ? pressure : sectionData, currentView)}
+        />
 
         {page === "pressure" && pressure && <PressurePage pressure={pressure} />}
-        {page === "logjams" && triage && <LogjamsPage groups={filteredLogjams} jobsById={jobsById} />}
-        {page === "pending" && triage && (
+        {page === "logjams" && <LogjamsPage response={sectionData} loading={loadingSection} />}
+        {page === "pending" && (
           <PendingPage
-            groups={filteredPendingGroups}
-            jobs={filteredPendingJobs}
-            jobsById={jobsById}
+            response={sectionData}
+            loading={loadingSection}
             view={pendingView}
             onViewChange={setPendingView}
+            offset={jobOffsets.pending}
+            onPageChange={(offset) => setJobOffsets((current) => ({ ...current, pending: offset }))}
           />
         )}
-        {page === "running" && triage && (
+        {page === "running" && (
           <RunningPage
-            groups={filteredRunningGroups}
-            jobs={filteredRunningJobs}
-            jobsById={jobsById}
+            response={sectionData}
+            loading={loadingSection}
             view={runningView}
             onViewChange={setRunningView}
+            offset={jobOffsets.running}
+            onPageChange={(offset) => setJobOffsets((current) => ({ ...current, running: offset }))}
           />
         )}
         {page === "watchlist" && <WatchlistPage items={watchItems} statuses={watchStatuses} />}
@@ -278,7 +294,7 @@ function PressurePage({ pressure }) {
       <section className="panel">
         <div className="panel-header">
           <h3>Account hotspots</h3>
-          <div className="detail-chip">Sorted by pending volume</div>
+          <div className="detail-chip">Served from the latest collector snapshot</div>
         </div>
         <table className="data-table">
           <thead>
@@ -305,7 +321,7 @@ function PressurePage({ pressure }) {
       <section className="panel">
         <div className="panel-header">
           <h3>Partition posture</h3>
-          <div className="detail-chip">Same view, split by partition</div>
+          <div className="detail-chip">{relativeSnapshot(pressure.snapshotTakenAt)}</div>
         </div>
         <table className="data-table">
           <thead>
@@ -332,128 +348,154 @@ function PressurePage({ pressure }) {
   );
 }
 
-function LogjamsPage({ groups, jobsById }) {
-  if (groups.length === 0) {
-    return <EmptyState title="No logjams detected" detail="There are no flows with both running parents and pending children in the current snapshot." />;
+function LogjamsPage({ response, loading }) {
+  const groups = response?.data?.items || [];
+  if (!loading && groups.length === 0) {
+    return <EmptyState title="No logjams detected" detail="There are no flows with both running parents and pending children in the current filtered snapshot." />;
   }
-
   return (
     <div className="stack">
-      {groups.map((group) => {
-        const childJobs = group.childJobIds.map((jobId) => jobsById[jobId]).filter(Boolean);
-        return (
-          <section key={group.flowKey} className="panel">
-            <div className="panel-header">
-              <div>
-                <h3>{wckeyLabel(group.wckey || group.label)}</h3>
-                <p className="panel-subtitle">{group.workdirRoot || "Flow traced from WCKey only"}</p>
-              </div>
-              <div className="metric-row">
-                <MetricChip label="Blocked children" value={group.blockedChildren} />
-                <MetricChip label="Running parents" value={group.runningCount} />
-                <MetricChip label="Oldest wait" value={fmtHours(group.maxWaitHours)} />
-              </div>
+      <SectionCap total={response?.data?.total} shown={response?.data?.shown} noun="logjams" />
+      {groups.map((group) => (
+        <section key={group.flowKey} className="panel">
+          <div className="panel-header">
+            <div>
+              <h3>{wckeyLabel(group.wckey || group.label)}</h3>
+              <p className="panel-subtitle">{group.workdirRoot || "Flow traced from WCKey only"}</p>
             </div>
-
-            <FlowBoard
-              lanes={[
-                { title: "Origin parents", items: group.originParents, empty: "No origin parents in sample" },
-                { title: "Active parents", items: group.runningParents, empty: "No active parent jobs" },
-                { title: "Queue friction", items: reasonMixEntries(group.reasonMix).map(([category, count]) => ({ jobId: category, name: `${count} job(s)`, state: category })), type: "reason", empty: "No queue pressure" },
-                { title: "Impacted pending jobs", items: childJobs, empty: "No impacted jobs" },
-              ]}
-            />
-
-            <div className="inline-note">{group.message}</div>
-          </section>
-        );
-      })}
+            <div className="metric-row">
+              <MetricChip label="Blocked children" value={group.blockedChildren} />
+              <MetricChip label="Running parents" value={group.runningCount} />
+              <MetricChip label="Oldest wait" value={fmtHours(group.maxWaitHours)} />
+            </div>
+          </div>
+          <FlowBoard
+            lanes={[
+              { title: "Origin parents", items: group.originParents, empty: "No origin parent in sample" },
+              { title: "Active parents", items: group.runningParents, empty: "No active parent in sample" },
+              { title: "Queue friction", items: reasonMixEntries(group.reasonMix).map(([category, count]) => ({ jobId: category, name: `${count} job(s)`, state: category })), type: "reason", empty: "No queue pressure" },
+              { title: "Impacted pending jobs", items: group.children, empty: "No impacted jobs in sample" },
+            ]}
+          />
+          <div className="inline-note">{group.message}</div>
+        </section>
+      ))}
     </div>
   );
 }
 
-function PendingPage({ groups, jobs, jobsById, view, onViewChange }) {
+function PendingPage({ response, loading, view, onViewChange, offset, onPageChange }) {
+  const details = response?.details || {};
+  const groups = response?.data?.items || [];
+  const jobs = response?.data?.items || [];
   return (
     <div className="stack">
       <div className="page-toolbar">
         <div className="metric-row">
-          <MetricChip label="Flows with pending" value={groups.length} />
-          <MetricChip label="Pending jobs" value={jobs.length} />
-          <MetricChip label="Oldest wait" value={jobs.length ? fmtHours(Math.max(...jobs.map((job) => job.waitHours))) : "0.0h"} />
+          <MetricChip label="Flows with pending" value={details.groupedFlows || 0} />
+          <MetricChip label="Pending jobs" value={details.count || 0} />
+          <MetricChip label="Oldest wait" value={fmtHours(details.maxWaitHours || 0)} />
         </div>
         <ViewToggle value={view} onChange={onViewChange} />
       </div>
 
       {view === "graph" ? (
-        groups.length === 0 ? <EmptyState title="No pending jobs match the current filter" detail="Try clearing the search or switching clusters." /> : groups.map((group) => (
-          <section key={group.flowKey} className="panel">
-            <div className="panel-header">
-              <div>
-                <h3>{wckeyLabel(group.wckey || group.label)}</h3>
-                <p className="panel-subtitle">{group.workdirRoot || "No shared workdir root available"}</p>
-              </div>
-              <div className="metric-row">
-                <MetricChip label="Pending jobs" value={group.pendingCount} />
-                <MetricChip label="Avg wait" value={fmtHours(group.avgWaitHours)} />
-                <MetricChip label="Oldest wait" value={fmtHours(group.maxWaitHours)} />
-              </div>
-            </div>
-
-            <FlowBoard
-              lanes={[
-                { title: "Flow / WCKey", items: [{ jobId: group.flowKey, name: group.label, state: group.accounts.join(", "), workdir: group.workdirRoot }], type: "flow" },
-                { title: "Parent blockers", items: group.blockers.length ? group.blockers : group.originParents, empty: "No visible parent blocker in snapshot" },
-                { title: "Pending pressure", items: reasonMixEntries(group.reasonMix).map(([category, count]) => ({ jobId: category, name: `${count} job(s)`, state: category })), type: "reason" },
-                { title: "Impacted jobs", items: group.pendingJobIds.map((jobId) => jobsById[jobId]).filter(Boolean), empty: "No matching jobs in view" },
-              ]}
-            />
-          </section>
-        ))
+        !loading && groups.length === 0 ? <EmptyState title="No pending jobs match the current filter" detail="Try clearing the search or switching clusters." /> : (
+          <>
+            <SectionCap total={response?.data?.total} shown={response?.data?.shown} noun="pending flows" />
+            {groups.map((group) => (
+              <section key={group.flowKey} className="panel">
+                <div className="panel-header">
+                  <div>
+                    <h3>{wckeyLabel(group.wckey || group.label)}</h3>
+                    <p className="panel-subtitle">{group.workdirRoot || "No shared workdir root available"}</p>
+                  </div>
+                  <div className="metric-row">
+                    <MetricChip label="Pending jobs" value={group.pendingCount} />
+                    <MetricChip label="Avg wait" value={fmtHours(group.avgWaitHours)} />
+                    <MetricChip label="Oldest wait" value={fmtHours(group.maxWaitHours)} />
+                  </div>
+                </div>
+                <FlowBoard
+                  lanes={[
+                    { title: "Flow / WCKey", items: [{ jobId: group.flowKey, name: group.label, state: group.accountLabel, workdir: group.workdirRoot }], type: "flow" },
+                    { title: "Parent blockers", items: group.blockers.length ? group.blockers : group.originParents, empty: "No visible parent blocker in snapshot" },
+                    { title: "Pending pressure", items: reasonMixEntries(group.reasonMix).map(([category, count]) => ({ jobId: category, name: `${count} job(s)`, state: category })), type: "reason" },
+                    { title: "Impacted jobs", items: group.pendingJobs, empty: "No sampled jobs for this flow" },
+                  ]}
+                />
+              </section>
+            ))}
+          </>
+        )
       ) : (
-        <JobsList title="Pending jobs grouped by WCKey" jobs={jobs} jobsById={jobsById} mode="pending" />
+        <JobsList
+          title="Pending jobs grouped by WCKey"
+          jobs={jobs}
+          mode="pending"
+          total={response?.data?.total || 0}
+          limit={response?.data?.limit || LIST_JOB_LIMIT}
+          offset={offset}
+          onPageChange={onPageChange}
+        />
       )}
     </div>
   );
 }
 
-function RunningPage({ groups, jobs, jobsById, view, onViewChange }) {
+function RunningPage({ response, loading, view, onViewChange, offset, onPageChange }) {
+  const details = response?.details || {};
+  const groups = response?.data?.items || [];
+  const jobs = response?.data?.items || [];
   return (
     <div className="stack">
       <div className="page-toolbar">
         <div className="metric-row">
-          <MetricChip label="Running flows" value={groups.length} />
-          <MetricChip label="Running jobs" value={jobs.length} />
-          <MetricChip label="Longest runtime" value={jobs.length ? fmtHours(Math.max(...jobs.map((job) => job.elapsedHours))) : "0.0h"} />
+          <MetricChip label="Running flows" value={details.groupedFlows || 0} />
+          <MetricChip label="Running jobs" value={details.count || 0} />
+          <MetricChip label="Longest runtime" value={fmtHours(details.maxElapsedHours || 0)} />
         </div>
         <ViewToggle value={view} onChange={onViewChange} />
       </div>
 
       {view === "graph" ? (
-        groups.length === 0 ? <EmptyState title="No running jobs match the current filter" detail="Try clearing the search or switching clusters." /> : groups.map((group) => (
-          <section key={group.flowKey} className="panel">
-            <div className="panel-header">
-              <div>
-                <h3>{wckeyLabel(group.wckey || group.label)}</h3>
-                <p className="panel-subtitle">{group.workdirRoot || "No shared workdir root available"}</p>
-              </div>
-              <div className="metric-row">
-                <MetricChip label="Running jobs" value={group.runningCount} />
-                <MetricChip label="Avg runtime" value={fmtHours(group.avgElapsedHours)} />
-                <MetricChip label="Longest runtime" value={fmtHours(group.maxElapsedHours)} />
-              </div>
-            </div>
-
-            <FlowBoard
-              lanes={[
-                { title: "Flow / WCKey", items: [{ jobId: group.flowKey, name: group.label, state: group.users.join(", "), workdir: group.workdirRoot }], type: "flow" },
-                { title: "Origin trace", items: group.originParents, empty: "No origin parent in snapshot" },
-                { title: "Running jobs", items: group.runningJobIds.map((jobId) => jobsById[jobId]).filter(Boolean), empty: "No running jobs in view" },
-              ]}
-            />
-          </section>
-        ))
+        !loading && groups.length === 0 ? <EmptyState title="No running jobs match the current filter" detail="Try clearing the search or switching clusters." /> : (
+          <>
+            <SectionCap total={response?.data?.total} shown={response?.data?.shown} noun="running flows" />
+            {groups.map((group) => (
+              <section key={group.flowKey} className="panel">
+                <div className="panel-header">
+                  <div>
+                    <h3>{wckeyLabel(group.wckey || group.label)}</h3>
+                    <p className="panel-subtitle">{group.workdirRoot || "No shared workdir root available"}</p>
+                  </div>
+                  <div className="metric-row">
+                    <MetricChip label="Running jobs" value={group.runningCount} />
+                    <MetricChip label="Avg runtime" value={fmtHours(group.avgElapsedHours)} />
+                    <MetricChip label="Longest runtime" value={fmtHours(group.maxElapsedHours)} />
+                  </div>
+                </div>
+                <FlowBoard
+                  lanes={[
+                    { title: "Flow / WCKey", items: [{ jobId: group.flowKey, name: group.label, state: group.userLabel, workdir: group.workdirRoot }], type: "flow" },
+                    { title: "Origin trace", items: group.originParents, empty: "No origin parent in snapshot" },
+                    { title: "Running jobs", items: group.runningJobs, empty: "No sampled running jobs for this flow" },
+                  ]}
+                />
+              </section>
+            ))}
+          </>
+        )
       ) : (
-        <JobsList title="Running jobs grouped by WCKey" jobs={jobs} jobsById={jobsById} mode="running" />
+        <JobsList
+          title="Running jobs grouped by WCKey"
+          jobs={jobs}
+          mode="running"
+          total={response?.data?.total || 0}
+          limit={response?.data?.limit || LIST_JOB_LIMIT}
+          offset={offset}
+          onPageChange={onPageChange}
+        />
       )}
     </div>
   );
@@ -463,7 +505,6 @@ function WatchlistPage({ items, statuses }) {
   if (items.length === 0) {
     return <EmptyState title="No watchlist items yet" detail="POST /api/watch with a matcher to pin jobs, users, WCKeys, or workdirs." />;
   }
-
   return (
     <div className="stack">
       {items.map((item) => {
@@ -499,15 +540,16 @@ function WatchlistPage({ items, statuses }) {
   );
 }
 
-function JobsList({ title, jobs, jobsById, mode }) {
+function JobsList({ title, jobs, mode, total, limit, offset, onPageChange }) {
   const groups = groupJobsByFlow(jobs);
   if (groups.length === 0) return <EmptyState title="No jobs match the current filter" detail="Try clearing the search or switching clusters." />;
   return (
     <section className="panel">
       <div className="panel-header">
         <h3>{title}</h3>
-        <div className="detail-chip">{jobs.length} jobs</div>
+        <div className="detail-chip">{total} matching jobs</div>
       </div>
+      <PaginationBar total={total} limit={limit} offset={offset} onPageChange={onPageChange} />
       {groups.map((group) => (
         <div key={group.key} className="job-group">
           <div className="job-group-head">
@@ -538,7 +580,7 @@ function JobsList({ title, jobs, jobsById, mode }) {
                   <td>{job.user}<div className="muted">{job.account}</div></td>
                   <td>{mode === "pending" ? <ReasonPill category={job.category} /> : job.state}</td>
                   <td>{mode === "pending" ? fmtHours(job.waitHours) : fmtHours(job.elapsedHours)}</td>
-                  <td><ParentList job={job} jobsById={jobsById} /></td>
+                  <td><ParentList job={job} /></td>
                   <td><WorkdirLink job={job} /></td>
                 </tr>
               ))}
@@ -546,7 +588,23 @@ function JobsList({ title, jobs, jobsById, mode }) {
           </table>
         </div>
       ))}
+      <PaginationBar total={total} limit={limit} offset={offset} onPageChange={onPageChange} />
     </section>
+  );
+}
+
+function PaginationBar({ total, limit, offset, onPageChange }) {
+  if (total <= limit) return null;
+  const start = offset + 1;
+  const end = Math.min(offset + limit, total);
+  return (
+    <div className="pagination-bar">
+      <span className="muted">Showing {start}-{end} of {total}</span>
+      <div className="toggle-group">
+        <button className="toggle-pill" onClick={() => onPageChange(Math.max(0, offset - limit))} disabled={offset === 0}>Prev</button>
+        <button className="toggle-pill" onClick={() => onPageChange(offset + limit)} disabled={offset + limit >= total}>Next</button>
+      </div>
+    </div>
   );
 }
 
@@ -582,7 +640,6 @@ function FlowCard({ item, type }) {
       </div>
     );
   }
-
   if (type === "flow") {
     return (
       <div className="flow-card">
@@ -594,7 +651,6 @@ function FlowCard({ item, type }) {
       </div>
     );
   }
-
   const job = item;
   return (
     <div className="flow-card">
@@ -613,17 +669,12 @@ function FlowCard({ item, type }) {
 
 function WorkdirLink({ job }) {
   if (!job.workdirHref) return <span className="muted">n/a</span>;
-  return (
-    <a className="workdir-link" href={job.workdirHref} target="_blank" rel="noreferrer">
-      {job.workdir}
-    </a>
-  );
+  return <a className="workdir-link" href={job.workdirHref} target="_blank" rel="noreferrer">{job.workdir}</a>;
 }
 
-function ParentList({ job, jobsById }) {
-  const parentIds = job.blockerIds?.length ? job.blockerIds : (job.originParentIds || []).filter((jobId) => jobId !== job.jobId);
-  const parents = parentIds.map((jobId) => jobsById[jobId]).filter(Boolean);
-  if (!parents?.length) return <span className="muted">No parent blocker visible</span>;
+function ParentList({ job }) {
+  const parents = job.parents || [];
+  if (!parents.length) return <span className="muted">No parent blocker visible</span>;
   return (
     <div className="parent-list">
       {parents.slice(0, 3).map((parent) => (
@@ -636,15 +687,16 @@ function ParentList({ job, jobsById }) {
   );
 }
 
+function SectionCap({ total, shown, noun }) {
+  if (!total || total <= shown) return null;
+  return <div className="detail-chip">Showing top {shown} of {total} {noun}. Refine the search to narrow further.</div>;
+}
+
 function ViewToggle({ value, onChange }) {
   return (
     <div className="toggle-group">
       {["graph", "list"].map((option) => (
-        <button
-          key={option}
-          className={value === option ? "toggle-pill active" : "toggle-pill"}
-          onClick={() => onChange(option)}
-        >
+        <button key={option} className={value === option ? "toggle-pill active" : "toggle-pill"} onClick={() => onChange(option)}>
           {option}
         </button>
       ))}
@@ -685,4 +737,8 @@ function EmptyState({ title, detail }) {
       <p>{detail}</p>
     </section>
   );
+}
+
+function reasonMixEntries(reasonMix = {}) {
+  return Object.entries(reasonMix).sort((a, b) => b[1] - a[1]);
 }

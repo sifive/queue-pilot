@@ -9,6 +9,9 @@ const byPendingAge = (a, b) => (b.pendingSeconds || 0) - (a.pendingSeconds || 0)
 const byElapsedAge = (a, b) => (b.elapsedSeconds || 0) - (a.elapsedSeconds || 0) || String(a.jobId).localeCompare(String(b.jobId));
 const byCount = (a, b) => (b.pendingCount || b.runningCount || b.jobCount || 0) - (a.pendingCount || a.runningCount || a.jobCount || 0)
   || (b.maxWaitHours || b.maxElapsedHours || 0) - (a.maxWaitHours || a.maxElapsedHours || 0);
+const DEFAULT_GROUP_LIMIT = 40;
+const DEFAULT_JOB_LIMIT = 200;
+const DEFAULT_GRAPH_SAMPLE_LIMIT = 8;
 
 function avg(values) {
   if (values.length === 0) return 0;
@@ -37,6 +40,169 @@ function summarizeJob(job) {
     workdir: job.workdir,
     waitHours: job.waitHours,
     elapsedHours: job.elapsedHours,
+  };
+}
+
+function summarizeParent(job) {
+  return {
+    jobId: job.jobId,
+    name: job.name,
+    state: job.state,
+  };
+}
+
+function detailedJob(job, jobsById) {
+  const parentIds = job.blockerIds?.length ? job.blockerIds : (job.originParentIds || []).filter((jobId) => jobId !== job.jobId);
+  return {
+    jobId: job.jobId,
+    name: job.name,
+    state: job.state,
+    user: job.user,
+    account: job.account,
+    partition: job.partition,
+    reason: job.reason,
+    category: job.category,
+    explain: job.explain,
+    wckey: job.wckey,
+    flowKey: job.flowKey,
+    workdir: job.workdir,
+    workdirRoot: job.workdirRoot,
+    workdirHref: job.workdirHref,
+    waitHours: job.waitHours,
+    elapsedHours: job.elapsedHours,
+    blockerIds: job.blockerIds,
+    originParentIds: job.originParentIds,
+    parents: parentIds.map((jobId) => jobsById.get(String(jobId))).filter(Boolean).slice(0, 4).map(summarizeParent),
+  };
+}
+
+function searchTextForJob(job) {
+  return [
+    job.jobId,
+    job.name,
+    job.user,
+    job.account,
+    job.partition,
+    job.state,
+    job.reason,
+    job.wckey,
+    job.flowKey,
+    job.workdir,
+    job.dependency,
+    ...(job.blockerIds || []),
+    ...(job.originParentIds || []),
+  ].join(" ").toLowerCase();
+}
+
+function matchesJobSearch(job, searchTerm) {
+  if (!searchTerm) return true;
+  return searchTextForJob(job).includes(searchTerm);
+}
+
+function matchesGroupSearch(group, searchTerm, jobsById) {
+  if (!searchTerm) return true;
+  const direct = [
+    group.label,
+    group.flowKey,
+    group.wckey,
+    group.workdirRoot,
+    ...group.users,
+    ...group.accounts,
+    ...group.partitions,
+    ...group.blockers.map((parent) => `${parent.jobId} ${parent.name}`),
+    ...group.originParents.map((parent) => `${parent.jobId} ${parent.name}`),
+  ].join(" ").toLowerCase();
+  if (direct.includes(searchTerm)) return true;
+  return (group.jobIds || []).some((jobId) => {
+    const job = jobsById.get(String(jobId));
+    return job ? matchesJobSearch(job, searchTerm) : false;
+  });
+}
+
+function clampInt(value, fallback, max = fallback) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return Math.min(parsed, max);
+}
+
+function graphJobSamples(jobIds, jobsById, limit = DEFAULT_GRAPH_SAMPLE_LIMIT) {
+  return jobIds.slice(0, limit).map((jobId) => jobsById.get(String(jobId))).filter(Boolean).map(summarizeJob);
+}
+
+function compactList(values, limit = 3) {
+  const items = values.filter(Boolean);
+  if (items.length <= limit) return items.join(", ");
+  return `${items.slice(0, limit).join(", ")} +${items.length - limit}`;
+}
+
+function serializeGroup(group, jobsById, sampleLimit = DEFAULT_GRAPH_SAMPLE_LIMIT) {
+  return {
+    flowKey: group.flowKey,
+    label: group.label,
+    wckey: group.wckey,
+    workdirRoot: group.workdirRoot,
+    jobCount: group.jobCount,
+    pendingCount: group.pendingCount,
+    runningCount: group.runningCount,
+    maxWaitHours: group.maxWaitHours,
+    avgWaitHours: group.avgWaitHours,
+    maxElapsedHours: group.maxElapsedHours,
+    avgElapsedHours: group.avgElapsedHours,
+    reasonMix: group.reasonMix,
+    blockerSource: group.blockerSource,
+    blockers: group.blockers,
+    originParents: group.originParents,
+    pendingJobs: graphJobSamples(group.pendingJobIds, jobsById, sampleLimit),
+    runningJobs: graphJobSamples(group.runningJobIds, jobsById, sampleLimit),
+    userLabel: compactList(group.users),
+    accountLabel: compactList(group.accounts),
+    partitionLabel: compactList(group.partitions),
+  };
+}
+
+function diagnosticsSummary(annotatedJobs, flowGroups, logjams) {
+  const pendingJobs = annotatedJobs.filter((job) => job.isPending);
+  const runningJobs = annotatedJobs.filter((job) => job.isRunning);
+  return {
+    totalJobs: annotatedJobs.length,
+    pendingCount: pendingJobs.length,
+    runningCount: runningJobs.length,
+    logjamCount: logjams.length,
+    uniqueFlows: flowGroups.length,
+  };
+}
+
+function pageSummary(groups, jobs, mode) {
+  if (mode === "pending") {
+    return {
+      count: jobs.length,
+      groupedFlows: groups.length,
+      maxWaitHours: jobs.length ? Math.max(...jobs.map((job) => job.waitHours)) : 0,
+      avgWaitHours: avg(jobs.map((job) => job.waitHours)),
+    };
+  }
+  return {
+    count: jobs.length,
+    groupedFlows: groups.length,
+    maxElapsedHours: jobs.length ? Math.max(...jobs.map((job) => job.elapsedHours)) : 0,
+    avgElapsedHours: avg(jobs.map((job) => job.elapsedHours)),
+  };
+}
+
+function serializeLogjam(group, jobsById, sampleLimit = DEFAULT_GRAPH_SAMPLE_LIMIT) {
+  return {
+    flowKey: group.flowKey,
+    label: group.label,
+    wckey: group.wckey,
+    workdirRoot: group.workdirRoot,
+    blockedChildren: group.pendingCount,
+    runningCount: group.runningCount,
+    maxWaitHours: group.maxWaitHours,
+    reasonMix: group.reasonMix,
+    originParents: group.originParents,
+    runningParents: graphJobSamples(group.runningJobIds, jobsById, sampleLimit),
+    children: graphJobSamples(group.pendingJobIds, jobsById, sampleLimit),
+    message: `Flow ${group.label} has ${group.runningCount} active parent run(s) with ${group.pendingCount} pending child job(s).`,
   };
 }
 
@@ -274,4 +440,75 @@ export function buildDiagnosticsDataset(jobs) {
       partitions: uniq(annotatedJobs.map((job) => job.partition)).sort(),
     },
   };
+}
+
+export function buildDiagnosticsView(jobs, options = {}) {
+  const section = options.section || "summary";
+  const view = options.view || "graph";
+  const searchTerm = String(options.search || "").trim().toLowerCase();
+  const groupLimit = clampInt(options.groupLimit, DEFAULT_GROUP_LIMIT, 200);
+  const jobLimit = clampInt(options.jobLimit, DEFAULT_JOB_LIMIT, 500);
+  const jobOffset = clampInt(options.jobOffset, 0, 1000000);
+  const sampleLimit = clampInt(options.sampleLimit, DEFAULT_GRAPH_SAMPLE_LIMIT, 20);
+
+  const annotatedJobs = annotateJobs(jobs);
+  const jobsById = new Map(annotatedJobs.map((job) => [String(job.jobId), job]));
+  const flowGroups = buildFlowGroups(annotatedJobs);
+  const logjamGroups = flowGroups
+    .filter((group) => group.runningCount > 0 && group.pendingCount > 0)
+    .sort((a, b) => b.pendingCount - a.pendingCount || b.maxWaitHours - a.maxWaitHours);
+  const summary = diagnosticsSummary(annotatedJobs, flowGroups, logjamGroups);
+
+  if (section === "summary") return { summary };
+
+  if (section === "logjams") {
+    const filtered = logjamGroups.filter((group) => matchesGroupSearch(group, searchTerm, jobsById));
+    return {
+      summary,
+      data: {
+        kind: "groups",
+        total: filtered.length,
+        shown: Math.min(filtered.length, groupLimit),
+        limit: groupLimit,
+        items: filtered.slice(0, groupLimit).map((group) => serializeLogjam(group, jobsById, sampleLimit)),
+      },
+    };
+  }
+
+  if (section === "pending" || section === "running") {
+    const mode = section;
+    const groupFilter = (group) => mode === "pending" ? group.pendingCount > 0 : group.runningCount > 0;
+    const jobFilter = (job) => mode === "pending" ? job.isPending : job.isRunning;
+    const filteredGroups = flowGroups.filter((group) => groupFilter(group) && matchesGroupSearch(group, searchTerm, jobsById));
+    const filteredJobs = annotatedJobs.filter((job) => jobFilter(job) && matchesJobSearch(job, searchTerm));
+    const details = pageSummary(filteredGroups, filteredJobs, mode);
+
+    if (view === "list") {
+      return {
+        summary,
+        details,
+        data: {
+          kind: "jobs",
+          total: filteredJobs.length,
+          offset: jobOffset,
+          limit: jobLimit,
+          items: filteredJobs.slice(jobOffset, jobOffset + jobLimit).map((job) => detailedJob(job, jobsById)),
+        },
+      };
+    }
+
+    return {
+      summary,
+      details,
+      data: {
+        kind: "groups",
+        total: filteredGroups.length,
+        shown: Math.min(filteredGroups.length, groupLimit),
+        limit: groupLimit,
+        items: filteredGroups.slice(0, groupLimit).map((group) => serializeGroup(group, jobsById, sampleLimit)),
+      },
+    };
+  }
+
+  return buildDiagnosticsDataset(jobs);
 }

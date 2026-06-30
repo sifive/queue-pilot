@@ -36,3 +36,24 @@ export function openDb() {
   `);
   return db;
 }
+
+export function latestSnapshot(db, cluster) {
+  return db.prepare(`
+    SELECT id, cluster, taken_at, pending_count, running_count, raw_json
+    FROM snapshot
+    WHERE cluster = ?
+    ORDER BY id DESC
+    LIMIT 1
+  `).get(cluster) || null;
+}
+
+export function latestSnapshotJobs(db, cluster) {
+  const snapshot = latestSnapshot(db, cluster);
+  if (!snapshot) return { snapshot: null, jobs: [] };
+  try {
+    const parsed = JSON.parse(snapshot.raw_json || "{}");
+    return { snapshot, jobs: Array.isArray(parsed.jobs) ? parsed.jobs : [] };
+  } catch {
+    return { snapshot, jobs: [] };
+  }
+}

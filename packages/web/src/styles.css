@@ -257,6 +257,13 @@ select {
   font-size: 0.82rem;
 }
 
+.hero-chip {
+  align-self: start;
+  color: #e2e8f0;
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.14);
+}
+
 .metric-row {
   display: flex;
   flex-wrap: wrap;
@@ -318,6 +325,11 @@ select {
 .toggle-pill.active {
   background: #0f172a;
   color: #f8fafc;
+}
+
+.toggle-pill:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .data-table {
@@ -416,6 +428,14 @@ select {
   padding-top: 1rem;
   margin-top: 1rem;
   border-top: 1px solid rgba(226, 232, 240, 0.7);
+}
+
+.pagination-bar {
+  display: flex;
+  gap: 0.8rem;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 1rem;
 }
 
 .parent-list {

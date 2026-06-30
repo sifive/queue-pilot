@@ -12,8 +12,7 @@ export function bucketize(jobs, keys = ["account", "user", "reason"]) {
   return [...map.values()].sort((a, b) => b.count - a.count);
 }
 
-export async function pressureSummary(adapter, cluster) {
-  const jobs = await adapter.listJobs({ cluster, states: "PD,R" });
+export function summarizePressureJobs(jobs, cluster) {
   const pending = jobs.filter((j) => /^(PD|PENDING)/i.test(j.state));
   const running = jobs.filter((j) => /^(R|RUNNING)/i.test(j.state));
   const byAccount = {};
@@ -47,4 +46,9 @@ export async function pressureSummary(adapter, cluster) {
     dominantReason: Object.entries(p.reasons).sort((x, y) => y[1] - x[1])[0]?.[0] || null,
   })).sort((x, y) => y.pending - x.pending);
   return { cluster, pendingCount: pending.length, runningCount: running.length, accounts, partitions };
+}
+
+export async function pressureSummary(adapter, cluster) {
+  const jobs = await adapter.listJobs({ cluster, states: "PD,R" });
+  return summarizePressureJobs(jobs, cluster);
 }
