@@ -9,9 +9,9 @@ const byPendingAge = (a, b) => (b.pendingSeconds || 0) - (a.pendingSeconds || 0)
 const byElapsedAge = (a, b) => (b.elapsedSeconds || 0) - (a.elapsedSeconds || 0) || String(a.jobId).localeCompare(String(b.jobId));
 const byCount = (a, b) => (b.pendingCount || b.runningCount || b.jobCount || 0) - (a.pendingCount || a.runningCount || a.jobCount || 0)
   || (b.maxWaitHours || b.maxElapsedHours || 0) - (a.maxWaitHours || a.maxElapsedHours || 0);
-const DEFAULT_GROUP_LIMIT = 40;
 const DEFAULT_JOB_LIMIT = 200;
 const DEFAULT_GRAPH_SAMPLE_LIMIT = 8;
+const NULLISH_FLOW_VALUES = new Set(["", "(null)", "null", "none", "/root"]);
 
 function avg(values) {
   if (values.length === 0) return 0;
@@ -135,6 +135,23 @@ function compactList(values, limit = 3) {
   return `${items.slice(0, limit).join(", ")} +${items.length - limit}`;
 }
 
+function normalizedFlowValue(value = "") {
+  return String(value || "").trim().toLowerCase();
+}
+
+function isNullishFlowValue(value = "") {
+  return NULLISH_FLOW_VALUES.has(normalizedFlowValue(value));
+}
+
+export function isControlPlaneGroup(group) {
+  const workdirRoot = normalizedFlowValue(group.workdirRoot);
+  const label = normalizedFlowValue(group.label);
+  const flowKey = normalizedFlowValue(group.flowKey);
+  const wckey = normalizedFlowValue(group.wckey);
+  return workdirRoot === "/root"
+    || (isNullishFlowValue(label) && (workdirRoot === "/root" || isNullishFlowValue(flowKey) || isNullishFlowValue(wckey)));
+}
+
 function serializeGroup(group, jobsById, sampleLimit = DEFAULT_GRAPH_SAMPLE_LIMIT) {
   return {
     flowKey: group.flowKey,
@@ -157,6 +174,7 @@ function serializeGroup(group, jobsById, sampleLimit = DEFAULT_GRAPH_SAMPLE_LIMI
     userLabel: compactList(group.users),
     accountLabel: compactList(group.accounts),
     partitionLabel: compactList(group.partitions),
+    isControlPlane: isControlPlaneGroup(group),
   };
 }
 
@@ -203,6 +221,7 @@ function serializeLogjam(group, jobsById, sampleLimit = DEFAULT_GRAPH_SAMPLE_LIM
     runningParents: graphJobSamples(group.runningJobIds, jobsById, sampleLimit),
     children: graphJobSamples(group.pendingJobIds, jobsById, sampleLimit),
     message: `Flow ${group.label} has ${group.runningCount} active parent run(s) with ${group.pendingCount} pending child job(s).`,
+    isControlPlane: isControlPlaneGroup(group),
   };
 }
 
@@ -405,6 +424,7 @@ export function buildDiagnosticsDataset(jobs) {
       runningCount: runningJobs.length,
       logjamCount: logjams.length,
       uniqueFlows: flowGroups.length,
+      controlPlaneFlows: flowGroups.filter((group) => isControlPlaneGroup(group)).length,
     },
     jobs: annotatedJobs,
     flows: flowGroups,
@@ -446,7 +466,6 @@ export function buildDiagnosticsView(jobs, options = {}) {
   const section = options.section || "summary";
   const view = options.view || "graph";
   const searchTerm = String(options.search || "").trim().toLowerCase();
-  const groupLimit = clampInt(options.groupLimit, DEFAULT_GROUP_LIMIT, 200);
   const jobLimit = clampInt(options.jobLimit, DEFAULT_JOB_LIMIT, 500);
   const jobOffset = clampInt(options.jobOffset, 0, 1000000);
   const sampleLimit = clampInt(options.sampleLimit, DEFAULT_GRAPH_SAMPLE_LIMIT, 20);
@@ -454,7 +473,9 @@ export function buildDiagnosticsView(jobs, options = {}) {
   const annotatedJobs = annotateJobs(jobs);
   const jobsById = new Map(annotatedJobs.map((job) => [String(job.jobId), job]));
   const flowGroups = buildFlowGroups(annotatedJobs);
-  const logjamGroups = flowGroups
+  const controlGroups = flowGroups.filter((group) => isControlPlaneGroup(group));
+  const standardGroups = flowGroups.filter((group) => !isControlPlaneGroup(group));
+  const logjamGroups = standardGroups
     .filter((group) => group.runningCount > 0 && group.pendingCount > 0)
     .sort((a, b) => b.pendingCount - a.pendingCount || b.maxWaitHours - a.maxWaitHours);
   const summary = diagnosticsSummary(annotatedJobs, flowGroups, logjamGroups);
@@ -468,19 +489,47 @@ export function buildDiagnosticsView(jobs, options = {}) {
       data: {
         kind: "groups",
         total: filtered.length,
-        shown: Math.min(filtered.length, groupLimit),
-        limit: groupLimit,
-        items: filtered.slice(0, groupLimit).map((group) => serializeLogjam(group, jobsById, sampleLimit)),
+        shown: filtered.length,
+        limit: null,
+        items: filtered.map((group) => serializeLogjam(group, jobsById, sampleLimit)),
+      },
+    };
+  }
+
+  if (section === "control") {
+    const filtered = controlGroups.filter((group) => matchesGroupSearch(group, searchTerm, jobsById));
+    const controlFlowKeys = new Set(controlGroups.map((group) => group.flowKey));
+    const controlJobs = annotatedJobs.filter((job) => controlFlowKeys.has(job.flowKey || `job:${job.jobId}`));
+    return {
+      summary,
+      details: {
+        count: controlJobs.length,
+        groupedFlows: filtered.length,
+        maxWaitHours: controlJobs.length ? Math.max(...controlJobs.map((job) => job.waitHours)) : 0,
+        maxElapsedHours: controlJobs.length ? Math.max(...controlJobs.map((job) => job.elapsedHours)) : 0,
+      },
+      data: {
+        kind: "groups",
+        total: filtered.length,
+        shown: filtered.length,
+        limit: null,
+        items: filtered.map((group) => serializeGroup(group, jobsById, sampleLimit)),
       },
     };
   }
 
   if (section === "pending" || section === "running") {
     const mode = section;
+    const visibleGroups = standardGroups;
+    const visibleFlowKeys = new Set(visibleGroups.map((group) => group.flowKey));
     const groupFilter = (group) => mode === "pending" ? group.pendingCount > 0 : group.runningCount > 0;
     const jobFilter = (job) => mode === "pending" ? job.isPending : job.isRunning;
-    const filteredGroups = flowGroups.filter((group) => groupFilter(group) && matchesGroupSearch(group, searchTerm, jobsById));
-    const filteredJobs = annotatedJobs.filter((job) => jobFilter(job) && matchesJobSearch(job, searchTerm));
+    const filteredGroups = visibleGroups.filter((group) => groupFilter(group) && matchesGroupSearch(group, searchTerm, jobsById));
+    const filteredJobs = annotatedJobs.filter((job) =>
+      visibleFlowKeys.has(job.flowKey || `job:${job.jobId}`) &&
+      jobFilter(job) &&
+      matchesJobSearch(job, searchTerm)
+    );
     const details = pageSummary(filteredGroups, filteredJobs, mode);
 
     if (view === "list") {
@@ -503,9 +552,9 @@ export function buildDiagnosticsView(jobs, options = {}) {
       data: {
         kind: "groups",
         total: filteredGroups.length,
-        shown: Math.min(filteredGroups.length, groupLimit),
-        limit: groupLimit,
-        items: filteredGroups.slice(0, groupLimit).map((group) => serializeGroup(group, jobsById, sampleLimit)),
+        shown: filteredGroups.length,
+        limit: null,
+        items: filteredGroups.map((group) => serializeGroup(group, jobsById, sampleLimit)),
       },
     };
   }

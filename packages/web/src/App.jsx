@@ -1,16 +1,17 @@
 import React, { startTransition, useDeferredValue, useEffect, useState } from "react";
 import { api } from "./api.js";
+import { FlowGraph } from "./FlowGraph.jsx";
 
 const PAGE_META = {
   pressure: { label: "Pressure", kicker: "Queue posture", title: "Cluster pressure by account and partition" },
   logjams: { label: "Logjams", kicker: "True blockers", title: "Trace the flows where running parents are holding pending work behind them" },
+  control: { label: "Control Plane", kicker: "Orchestration", title: "Separate the /root and (null) orchestration flows from normal verification traffic" },
   pending: { label: "Pending", kicker: "Waiting traffic", title: "Search and inspect pending jobs without loading the entire farm into the browser" },
   running: { label: "Running", kicker: "Active traffic", title: "Inspect currently running flows with aggregated graph and paged list views" },
   watchlist: { label: "Watchlist", kicker: "Jobs of interest", title: "Track saved job matchers with ETA and diagnosis context" },
 };
 
-const PAGE_ORDER = ["pressure", "logjams", "pending", "running", "watchlist"];
-const GRAPH_GROUP_LIMIT = 32;
+const PAGE_ORDER = ["pressure", "logjams", "control", "pending", "running", "watchlist"];
 const LIST_JOB_LIMIT = 200;
 const REASON_COLORS = {
   priority: "#0f766e",
@@ -72,14 +73,15 @@ function relativeSnapshot(takenAt) {
 function pageDetail(page, data, view) {
   if (!data) return "Loading...";
   if (page === "pressure") return relativeSnapshot(data.snapshotTakenAt);
-  if (page === "logjams") return `Showing ${data.data?.shown || 0} of ${data.data?.total || 0} logjams`;
+  if (page === "logjams") return `${data.data?.total || 0} logjam flows`;
+  if (page === "control") return `${data.data?.total || 0} control-plane flows`;
   if (page === "pending" || page === "running") {
     if (view === "list") {
       const start = (data.data?.offset || 0) + 1;
       const end = Math.min((data.data?.offset || 0) + (data.data?.items?.length || 0), data.data?.total || 0);
       return `Jobs ${data.data?.total ? `${start}-${end}` : "0"} of ${data.data?.total || 0}`;
     }
-    return `Showing ${data.data?.shown || 0} of ${data.data?.total || 0} flows`;
+    return `${data.data?.total || 0} flow groups`;
   }
   return "Ready";
 }
@@ -101,6 +103,8 @@ export default function App() {
   const [loadingSection, setLoadingSection] = useState(false);
   const deferredSearch = useDeferredValue(search.trim());
   const currentView = page === "pending" ? pendingView : page === "running" ? runningView : "graph";
+  const searchPending = page !== "pressure" && page !== "watchlist" && (search.trim() !== deferredSearch || loadingSection);
+  const pageRefreshing = page === "watchlist" ? false : page === "pressure" ? loadingSummary : (loadingSummary || loadingSection);
 
   useEffect(() => {
     api.clusters().then((data) => {
@@ -119,6 +123,11 @@ export default function App() {
   useEffect(() => {
     setJobOffsets({ pending: 0, running: 0 });
   }, [cluster, deferredSearch, pendingView, runningView]);
+
+  useEffect(() => {
+    if (page === "pressure" || page === "watchlist") return;
+    setSectionData(null);
+  }, [cluster, page]);
 
   useEffect(() => {
     if (!cluster) return;
@@ -146,16 +155,11 @@ export default function App() {
     }
     const controller = new AbortController();
     const query = { section: page, search: deferredSearch };
-    if (page === "logjams") {
-      query.groupLimit = GRAPH_GROUP_LIMIT;
-      query.sampleLimit = 6;
-    }
+    if (page === "logjams" || page === "control") query.sampleLimit = 6;
     if (page === "pending" || page === "running") {
       query.view = currentView;
-      if (currentView === "graph") {
-        query.groupLimit = GRAPH_GROUP_LIMIT;
-        query.sampleLimit = 6;
-      } else {
+      if (currentView === "graph") query.sampleLimit = 6;
+      else {
         query.jobLimit = LIST_JOB_LIMIT;
         query.jobOffset = jobOffsets[page];
       }
@@ -190,6 +194,7 @@ export default function App() {
     startTransition(() => setPage(nextPage));
     window.location.hash = nextPage;
   };
+  const activeSummary = sectionData?.summary || summary?.summary;
   const snapshotTakenAt = sectionData?.snapshotTakenAt || summary?.snapshotTakenAt || pressure?.snapshotTakenAt;
 
   return (
@@ -197,12 +202,17 @@ export default function App() {
       <div className="background-orb background-orb-a" />
       <div className="background-orb background-orb-b" />
       <header className="hero">
-        <div>
-          <div className="hero-kicker">QueuePilot / EDA Queue Triage</div>
-          <h1>Faster pages, smaller payloads, clearer blockers.</h1>
-          <p>{currentPage.title}</p>
+        <div className="hero-main">
+          <div className="hero-title-row">
+            <div className="hero-kicker">QueuePilot / EDA Queue Triage</div>
+            <div className="detail-chip hero-chip">{relativeSnapshot(snapshotTakenAt)}</div>
+          </div>
+          <div className="hero-heading">
+            <h1>{currentPage.label}</h1>
+            <p>{currentPage.title}</p>
+          </div>
         </div>
-        <div className="hero-controls">
+        <div className="hero-controls compact">
           <label className="cluster-picker">
             <span>Cluster</span>
             <select value={cluster} onChange={(event) => setCluster(event.target.value)}>
@@ -211,25 +221,30 @@ export default function App() {
           </label>
           {page !== "pressure" && page !== "watchlist" ? (
             <label className="search-box">
-              <span>Server-side search</span>
-              <input
-                value={search}
-                onChange={(event) => setSearch(event.target.value)}
-                placeholder="job id, WCKey, blocker, workdir, user, account"
-              />
+              <span>Search</span>
+              <div className="search-input-wrap">
+                <input
+                  value={search}
+                  onChange={(event) => setSearch(event.target.value)}
+                  placeholder="job id, WCKey, blocker, workdir, user, account"
+                />
+                {searchPending ? (
+                  <div className="field-status" aria-live="polite" aria-label="Search in progress">
+                    <BusySpinner tone="light" size="sm" />
+                  </div>
+                ) : null}
+              </div>
             </label>
-          ) : (
-            <div className="detail-chip hero-chip">{relativeSnapshot(snapshotTakenAt)}</div>
-          )}
+          ) : null}
         </div>
       </header>
 
       <section className="summary-strip">
-        <StatCard label="Pending" value={summary?.summary?.pendingCount ?? pressure?.pendingCount ?? 0} tone="warm" />
-        <StatCard label="Running" value={summary?.summary?.runningCount ?? pressure?.runningCount ?? 0} tone="cool" />
-        <StatCard label="Logjams" value={summary?.summary?.logjamCount ?? 0} tone="danger" />
-        <StatCard label="Flows" value={summary?.summary?.uniqueFlows ?? 0} tone="neutral" />
-        <StatCard label="Snapshot" value={relativeSnapshot(snapshotTakenAt).replace("Snapshot ", "")} tone="cool" />
+        <StatCard label="Pending" value={activeSummary?.pendingCount ?? pressure?.pendingCount ?? 0} tone="warm" />
+        <StatCard label="Running" value={activeSummary?.runningCount ?? pressure?.runningCount ?? 0} tone="cool" />
+        <StatCard label="Logjams" value={activeSummary?.logjamCount ?? 0} tone="danger" />
+        <StatCard label="Control" value={activeSummary?.controlPlaneFlows ?? 0} tone="neutral" />
+        <StatCard label="Flows" value={activeSummary?.uniqueFlows ?? 0} tone="neutral" />
       </section>
 
       <nav className="top-nav">
@@ -245,11 +260,12 @@ export default function App() {
         <PageHeader
           kicker={currentPage.kicker}
           title={currentPage.title}
-          detail={loadingSummary || loadingSection ? "Refreshing..." : pageDetail(page, page === "pressure" ? pressure : sectionData, currentView)}
+          detail={pageRefreshing ? <BusyLabel label="Refreshing..." tone="dark" /> : pageDetail(page, page === "pressure" ? pressure : sectionData, currentView)}
         />
 
-        {page === "pressure" && pressure && <PressurePage pressure={pressure} />}
+        {page === "pressure" && <PressurePage pressure={pressure} loading={loadingSummary} />}
         {page === "logjams" && <LogjamsPage response={sectionData} loading={loadingSection} />}
+        {page === "control" && <ControlPlanePage response={sectionData} loading={loadingSection} />}
         {page === "pending" && (
           <PendingPage
             response={sectionData}
@@ -276,6 +292,46 @@ export default function App() {
   );
 }
 
+function ControlPlanePage({ response, loading }) {
+  const details = response?.details || {};
+  const groups = response?.data?.items || [];
+  if (loading && !response) {
+    return <LoadingState title="Loading control-plane flows" detail="Grouping the /root and (null) orchestration traffic now." />;
+  }
+  if (!loading && groups.length === 0) {
+    return <EmptyState title="No control-plane flows match the current filter" detail="This page isolates the /root and (null) orchestration flows from the normal job traffic." />;
+  }
+  return (
+    <div className="stack">
+      {loading ? <InlineLoadingNotice label="Refreshing control-plane flows" /> : null}
+      <div className="page-toolbar">
+        <div className="metric-row">
+          <MetricChip label="Control flows" value={details.groupedFlows || 0} />
+          <MetricChip label="Jobs" value={details.count || 0} />
+          <MetricChip label="Max wait" value={fmtHours(details.maxWaitHours || 0)} />
+          <MetricChip label="Max runtime" value={fmtHours(details.maxElapsedHours || 0)} />
+        </div>
+      </div>
+      {groups.map((group) => (
+        <section key={group.flowKey} className="panel">
+          <div className="panel-header">
+            <div>
+              <h3>{wckeyLabel(group.wckey || group.label)}</h3>
+              <p className="panel-subtitle">Dedicated orchestration flow view for Slurm and Jenkins control-plane activity.</p>
+            </div>
+            <div className="metric-row">
+              <MetricChip label="Running" value={group.runningCount} />
+              <MetricChip label="Blocked" value={group.pendingCount} />
+              <MetricChip label="Jobs" value={group.jobCount} />
+            </div>
+          </div>
+          <FlowGraph mode="control" group={group} />
+        </section>
+      ))}
+    </div>
+  );
+}
+
 function PageHeader({ kicker, title, detail }) {
   return (
     <div className="page-header">
@@ -283,14 +339,18 @@ function PageHeader({ kicker, title, detail }) {
         <div className="section-kicker">{kicker}</div>
         <h2>{title}</h2>
       </div>
-      <div className="detail-chip">{detail}</div>
+      {typeof detail === "string" ? <div className="detail-chip">{detail}</div> : detail}
     </div>
   );
 }
 
-function PressurePage({ pressure }) {
+function PressurePage({ pressure, loading }) {
+  if (loading && !pressure) {
+    return <LoadingState title="Loading pressure snapshot" detail="Pulling the latest cached account and partition pressure view." />;
+  }
   return (
     <div className="stack">
+      {loading ? <InlineLoadingNotice label="Refreshing cluster pressure" /> : null}
       <section className="panel">
         <div className="panel-header">
           <h3>Account hotspots</h3>
@@ -350,18 +410,21 @@ function PressurePage({ pressure }) {
 
 function LogjamsPage({ response, loading }) {
   const groups = response?.data?.items || [];
+  if (loading && !response) {
+    return <LoadingState title="Loading logjams" detail="Tracing blocker chains across the full cached flow set." />;
+  }
   if (!loading && groups.length === 0) {
     return <EmptyState title="No logjams detected" detail="There are no flows with both running parents and pending children in the current filtered snapshot." />;
   }
   return (
     <div className="stack">
-      <SectionCap total={response?.data?.total} shown={response?.data?.shown} noun="logjams" />
+      {loading ? <InlineLoadingNotice label="Refreshing logjams" /> : null}
       {groups.map((group) => (
         <section key={group.flowKey} className="panel">
           <div className="panel-header">
             <div>
               <h3>{wckeyLabel(group.wckey || group.label)}</h3>
-              <p className="panel-subtitle">{group.workdirRoot || "Flow traced from WCKey only"}</p>
+              <p className="panel-subtitle">Collapsed by flow tags and parent state to expose the real blockers between runs.</p>
             </div>
             <div className="metric-row">
               <MetricChip label="Blocked children" value={group.blockedChildren} />
@@ -369,14 +432,7 @@ function LogjamsPage({ response, loading }) {
               <MetricChip label="Oldest wait" value={fmtHours(group.maxWaitHours)} />
             </div>
           </div>
-          <FlowBoard
-            lanes={[
-              { title: "Origin parents", items: group.originParents, empty: "No origin parent in sample" },
-              { title: "Active parents", items: group.runningParents, empty: "No active parent in sample" },
-              { title: "Queue friction", items: reasonMixEntries(group.reasonMix).map(([category, count]) => ({ jobId: category, name: `${count} job(s)`, state: category })), type: "reason", empty: "No queue pressure" },
-              { title: "Impacted pending jobs", items: group.children, empty: "No impacted jobs in sample" },
-            ]}
-          />
+          <FlowGraph mode="logjam" group={group} />
           <div className="inline-note">{group.message}</div>
         </section>
       ))}
@@ -388,8 +444,12 @@ function PendingPage({ response, loading, view, onViewChange, offset, onPageChan
   const details = response?.details || {};
   const groups = response?.data?.items || [];
   const jobs = response?.data?.items || [];
+  if (loading && !response) {
+    return <LoadingState title="Loading pending jobs" detail="Fetching the pending view and grouping parent blockers now." />;
+  }
   return (
     <div className="stack">
+      {loading ? <InlineLoadingNotice label="Refreshing pending jobs" /> : null}
       <div className="page-toolbar">
         <div className="metric-row">
           <MetricChip label="Flows with pending" value={details.groupedFlows || 0} />
@@ -402,13 +462,12 @@ function PendingPage({ response, loading, view, onViewChange, offset, onPageChan
       {view === "graph" ? (
         !loading && groups.length === 0 ? <EmptyState title="No pending jobs match the current filter" detail="Try clearing the search or switching clusters." /> : (
           <>
-            <SectionCap total={response?.data?.total} shown={response?.data?.shown} noun="pending flows" />
             {groups.map((group) => (
               <section key={group.flowKey} className="panel">
                 <div className="panel-header">
                   <div>
                     <h3>{wckeyLabel(group.wckey || group.label)}</h3>
-                    <p className="panel-subtitle">{group.workdirRoot || "No shared workdir root available"}</p>
+                    <p className="panel-subtitle">Flow tags stay at the root; upstream blockers and waiting buckets stay collapsed.</p>
                   </div>
                   <div className="metric-row">
                     <MetricChip label="Pending jobs" value={group.pendingCount} />
@@ -416,14 +475,7 @@ function PendingPage({ response, loading, view, onViewChange, offset, onPageChan
                     <MetricChip label="Oldest wait" value={fmtHours(group.maxWaitHours)} />
                   </div>
                 </div>
-                <FlowBoard
-                  lanes={[
-                    { title: "Flow / WCKey", items: [{ jobId: group.flowKey, name: group.label, state: group.accountLabel, workdir: group.workdirRoot }], type: "flow" },
-                    { title: "Parent blockers", items: group.blockers.length ? group.blockers : group.originParents, empty: "No visible parent blocker in snapshot" },
-                    { title: "Pending pressure", items: reasonMixEntries(group.reasonMix).map(([category, count]) => ({ jobId: category, name: `${count} job(s)`, state: category })), type: "reason" },
-                    { title: "Impacted jobs", items: group.pendingJobs, empty: "No sampled jobs for this flow" },
-                  ]}
-                />
+                <FlowGraph mode="pending" group={group} />
               </section>
             ))}
           </>
@@ -447,8 +499,12 @@ function RunningPage({ response, loading, view, onViewChange, offset, onPageChan
   const details = response?.details || {};
   const groups = response?.data?.items || [];
   const jobs = response?.data?.items || [];
+  if (loading && !response) {
+    return <LoadingState title="Loading running jobs" detail="Collecting the active runners and their grouped flow context." />;
+  }
   return (
     <div className="stack">
+      {loading ? <InlineLoadingNotice label="Refreshing running jobs" /> : null}
       <div className="page-toolbar">
         <div className="metric-row">
           <MetricChip label="Running flows" value={details.groupedFlows || 0} />
@@ -461,13 +517,12 @@ function RunningPage({ response, loading, view, onViewChange, offset, onPageChan
       {view === "graph" ? (
         !loading && groups.length === 0 ? <EmptyState title="No running jobs match the current filter" detail="Try clearing the search or switching clusters." /> : (
           <>
-            <SectionCap total={response?.data?.total} shown={response?.data?.shown} noun="running flows" />
             {groups.map((group) => (
               <section key={group.flowKey} className="panel">
                 <div className="panel-header">
                   <div>
                     <h3>{wckeyLabel(group.wckey || group.label)}</h3>
-                    <p className="panel-subtitle">{group.workdirRoot || "No shared workdir root available"}</p>
+                    <p className="panel-subtitle">Grouped active runners under one inherited flow identity.</p>
                   </div>
                   <div className="metric-row">
                     <MetricChip label="Running jobs" value={group.runningCount} />
@@ -475,13 +530,7 @@ function RunningPage({ response, loading, view, onViewChange, offset, onPageChan
                     <MetricChip label="Longest runtime" value={fmtHours(group.maxElapsedHours)} />
                   </div>
                 </div>
-                <FlowBoard
-                  lanes={[
-                    { title: "Flow / WCKey", items: [{ jobId: group.flowKey, name: group.label, state: group.userLabel, workdir: group.workdirRoot }], type: "flow" },
-                    { title: "Origin trace", items: group.originParents, empty: "No origin parent in snapshot" },
-                    { title: "Running jobs", items: group.runningJobs, empty: "No sampled running jobs for this flow" },
-                  ]}
-                />
+                <FlowGraph mode="running" group={group} />
               </section>
             ))}
           </>
@@ -608,65 +657,6 @@ function PaginationBar({ total, limit, offset, onPageChange }) {
   );
 }
 
-function FlowBoard({ lanes }) {
-  return (
-    <div className="flow-board">
-      {lanes.map((lane, index) => (
-        <div key={`${lane.title}-${index}`} className="flow-lane">
-          <div className="flow-lane-head">
-            <span>{lane.title}</span>
-            {index < lanes.length - 1 ? <span className="flow-arrow">→</span> : null}
-          </div>
-          <div className="flow-lane-body">
-            {lane.items?.length ? lane.items.map((item) => <FlowCard key={`${lane.title}-${item.jobId}-${item.name}`} item={item} type={lane.type} />) : (
-              <div className="flow-card empty">{lane.empty || "No data"}</div>
-            )}
-          </div>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function FlowCard({ item, type }) {
-  if (type === "reason") {
-    return (
-      <div className="flow-card">
-        <div className="flow-card-head">
-          <strong>{item.jobId}</strong>
-          <ReasonPill category={item.state} />
-        </div>
-        <div className="muted">{item.name}</div>
-      </div>
-    );
-  }
-  if (type === "flow") {
-    return (
-      <div className="flow-card">
-        <div className="flow-card-head">
-          <strong>{wckeyLabel(item.name)}</strong>
-        </div>
-        <div className="muted">{item.state || "No owner/account summary"}</div>
-        {item.workdir ? <div className="muted">{item.workdir}</div> : null}
-      </div>
-    );
-  }
-  const job = item;
-  return (
-    <div className="flow-card">
-      <div className="flow-card-head">
-        <strong>{job.jobId}</strong>
-        {/^(PD|PENDING)/i.test(job.state) ? <ReasonPill category={job.category} /> : <StateBadge state={job.state} />}
-      </div>
-      <div>{job.name}</div>
-      <div className="muted">{job.user} / {job.account}</div>
-      {job.waitHours ? <div className="muted">Waiting {fmtHours(job.waitHours)}</div> : null}
-      {job.elapsedHours ? <div className="muted">Running {fmtHours(job.elapsedHours)}</div> : null}
-      {job.workdir ? <div className="muted">{job.workdir}</div> : null}
-    </div>
-  );
-}
-
 function WorkdirLink({ job }) {
   if (!job.workdirHref) return <span className="muted">n/a</span>;
   return <a className="workdir-link" href={job.workdirHref} target="_blank" rel="noreferrer">{job.workdir}</a>;
@@ -687,11 +677,6 @@ function ParentList({ job }) {
   );
 }
 
-function SectionCap({ total, shown, noun }) {
-  if (!total || total <= shown) return null;
-  return <div className="detail-chip">Showing top {shown} of {total} {noun}. Refine the search to narrow further.</div>;
-}
-
 function ViewToggle({ value, onChange }) {
   return (
     <div className="toggle-group">
@@ -701,6 +686,40 @@ function ViewToggle({ value, onChange }) {
         </button>
       ))}
     </div>
+  );
+}
+
+function BusyLabel({ label, tone = "default" }) {
+  return (
+    <div className={`detail-chip busy-label ${tone === "dark" ? "busy-label-dark" : ""}`}>
+      <BusySpinner tone={tone === "dark" ? "light" : "default"} size="sm" />
+      <span>{label}</span>
+    </div>
+  );
+}
+
+function BusySpinner({ tone = "default", size = "md" }) {
+  return <span className={`busy-spinner ${tone} ${size}`} aria-hidden="true" />;
+}
+
+function InlineLoadingNotice({ label }) {
+  return (
+    <div className="inline-loading" aria-live="polite">
+      <BusySpinner size="sm" />
+      <span>{label}</span>
+    </div>
+  );
+}
+
+function LoadingState({ title, detail }) {
+  return (
+    <section className="empty-state loading-state" aria-live="polite">
+      <BusySpinner size="lg" />
+      <div>
+        <h3>{title}</h3>
+        <p>{detail}</p>
+      </div>
+    </section>
   );
 }
 
@@ -726,10 +745,6 @@ function ReasonPill({ category }) {
   return <span className="reason-pill" style={{ background: REASON_COLORS[category] || REASON_COLORS.other }}>{category || "n/a"}</span>;
 }
 
-function StateBadge({ state }) {
-  return <span className="state-badge">{state || "n/a"}</span>;
-}
-
 function EmptyState({ title, detail }) {
   return (
     <section className="empty-state">
@@ -737,8 +752,4 @@ function EmptyState({ title, detail }) {
       <p>{detail}</p>
     </section>
   );
-}
-
-function reasonMixEntries(reasonMix = {}) {
-  return Object.entries(reasonMix).sort((a, b) => b[1] - a[1]);
 }
