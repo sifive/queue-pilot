@@ -2,8 +2,8 @@ import React, { useLayoutEffect, useRef, useState } from "react";
 import { hierarchy, tree } from "d3";
 import { createPortal } from "react-dom";
 
-const NODE_WIDTH = 230;
-const NODE_HEIGHT = 112;
+const NODE_WIDTH = 210;
+const NODE_HEIGHT = 94;
 const TOOLTIP_OFFSET = 16;
 const TOOLTIP_MARGIN = 12;
 const STOP_TAGS = new Set([
@@ -222,7 +222,7 @@ function buildGraphModel(mode, group) {
 
 function layoutGraph(model) {
   const root = hierarchy(model);
-  tree().nodeSize([NODE_HEIGHT + 34, NODE_WIDTH + 72])(root);
+  tree().nodeSize([NODE_HEIGHT + 24, NODE_WIDTH + 52])(root);
   const nodes = root.descendants();
   const minX = Math.min(...nodes.map((node) => node.x));
   const maxX = Math.max(...nodes.map((node) => node.x));
@@ -231,10 +231,10 @@ function layoutGraph(model) {
     root,
     nodes,
     links: root.links(),
-    width: maxY + NODE_WIDTH + 140,
-    height: maxX - minX + NODE_HEIGHT + 140,
-    offsetX: 48,
-    offsetY: 70 - minX,
+    width: maxY + NODE_WIDTH + 112,
+    height: maxX - minX + NODE_HEIGHT + 112,
+    offsetX: 36,
+    offsetY: 56 - minX,
   };
 }
 
