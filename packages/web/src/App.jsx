@@ -345,7 +345,7 @@ function PageHeader({ kicker, title, detail }) {
 }
 
 function PressurePage({ pressure, loading }) {
-  if (loading && !pressure) {
+  if (!pressure) {
     return <LoadingState title="Loading pressure snapshot" detail="Pulling the latest cached account and partition pressure view." />;
   }
   return (
