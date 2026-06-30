@@ -674,6 +674,265 @@ select {
   border: 1px solid rgba(148, 163, 184, 0.18);
 }
 
+.logjam-overview-panel {
+  overflow: hidden;
+}
+
+.logjam-flow-panel {
+  scroll-margin-top: 0.9rem;
+}
+
+.logjam-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.7rem;
+  margin-top: 0.8rem;
+}
+
+.logjam-summary-card {
+  padding: 0.7rem 0.72rem;
+  border-radius: 0.9rem;
+  background: linear-gradient(180deg, rgba(248, 250, 252, 0.9), rgba(255, 255, 255, 0.82));
+  border: 1px solid rgba(226, 232, 240, 0.82);
+}
+
+.logjam-summary-head,
+.logjam-timeline-header {
+  display: flex;
+  gap: 0.8rem;
+  align-items: start;
+  justify-content: space-between;
+}
+
+.logjam-summary-head strong,
+.logjam-timeline-header h4 {
+  margin: 0;
+  font-size: 0.92rem;
+  line-height: 1.1;
+}
+
+.logjam-summary-list {
+  display: grid;
+  gap: 0.38rem;
+  margin-top: 0.68rem;
+}
+
+.logjam-summary-item {
+  display: grid;
+  gap: 0.1rem;
+  width: 100%;
+  padding: 0.5rem 0.6rem;
+  border-radius: 0.75rem;
+  border: 1px solid rgba(226, 232, 240, 0.82);
+  background: rgba(255, 255, 255, 0.78);
+  text-align: left;
+  color: #0f172a;
+}
+
+.logjam-summary-item:not(.blocker) {
+  cursor: pointer;
+}
+
+.logjam-summary-item.blocker {
+  cursor: default;
+}
+
+.logjam-summary-item span {
+  font-size: 0.76rem;
+  font-weight: 650;
+  line-height: 1.18;
+}
+
+.logjam-summary-item small {
+  font-size: 0.68rem;
+  color: #64748b;
+  line-height: 1.2;
+}
+
+.logjam-summary-item:hover:not(.blocker) {
+  border-color: rgba(59, 130, 246, 0.24);
+  box-shadow: 0 10px 18px rgba(59, 130, 246, 0.08);
+}
+
+.logjam-timeline-shell {
+  margin-top: 0.8rem;
+  padding: 0.78rem;
+  border-radius: 0.96rem;
+  background: linear-gradient(180deg, rgba(241, 245, 249, 0.92), rgba(255, 255, 255, 0.9));
+  border: 1px solid rgba(226, 232, 240, 0.85);
+}
+
+.logjam-timeline-axis {
+  position: relative;
+  margin: 0.85rem 0 0.35rem 12.5rem;
+  height: 1.5rem;
+}
+
+.logjam-axis-tick {
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
+  color: #64748b;
+  font-size: 0.64rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+}
+
+.logjam-axis-tick::before {
+  content: "";
+  position: absolute;
+  inset: 1rem auto auto 50%;
+  width: 1px;
+  height: 0.55rem;
+  background: rgba(148, 163, 184, 0.5);
+  transform: translateX(-50%);
+}
+
+.logjam-axis-tick.is-now {
+  color: #0f172a;
+}
+
+.logjam-axis-tick.is-now::before {
+  height: 0.75rem;
+  background: rgba(15, 23, 42, 0.65);
+}
+
+.logjam-timeline-rows {
+  display: grid;
+  gap: 0.52rem;
+}
+
+.logjam-timeline-row {
+  display: grid;
+  grid-template-columns: minmax(11.5rem, 12.5rem) minmax(0, 1fr) minmax(10rem, 12rem);
+  gap: 0.75rem;
+  align-items: center;
+}
+
+.logjam-timeline-label {
+  display: grid;
+  gap: 0.12rem;
+  width: 100%;
+  padding: 0.5rem 0.55rem;
+  border-radius: 0.82rem;
+  border: 1px solid rgba(226, 232, 240, 0.86);
+  background: rgba(255, 255, 255, 0.82);
+  text-align: left;
+  color: #0f172a;
+  cursor: pointer;
+}
+
+.logjam-timeline-label span {
+  font-size: 0.74rem;
+  font-weight: 650;
+  line-height: 1.16;
+}
+
+.logjam-timeline-label small {
+  font-size: 0.66rem;
+  color: #64748b;
+  line-height: 1.2;
+}
+
+.logjam-timeline-label:hover {
+  border-color: rgba(249, 115, 22, 0.28);
+  box-shadow: 0 10px 18px rgba(249, 115, 22, 0.08);
+}
+
+.logjam-timeline-track {
+  position: relative;
+  height: 3.4rem;
+}
+
+.logjam-track-base,
+.logjam-track-now,
+.logjam-track-span {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+.logjam-track-base {
+  left: 0;
+  right: 0;
+  height: 2px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.32);
+}
+
+.logjam-track-now {
+  width: 2px;
+  height: 2.7rem;
+  margin-left: -1px;
+  background: rgba(15, 23, 42, 0.7);
+  border-radius: 999px;
+}
+
+.logjam-track-span {
+  height: 5px;
+  border-radius: 999px;
+}
+
+.logjam-track-span.past {
+  background: linear-gradient(90deg, rgba(245, 158, 11, 0.7), rgba(59, 130, 246, 0.45));
+}
+
+.logjam-track-span.future {
+  background: linear-gradient(90deg, rgba(59, 130, 246, 0.45), rgba(239, 68, 68, 0.58));
+  border-top: 1px dashed rgba(239, 68, 68, 0.3);
+  border-bottom: 1px dashed rgba(239, 68, 68, 0.3);
+}
+
+.logjam-track-marker {
+  position: absolute;
+  top: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  border: 2px solid rgba(255, 255, 255, 0.92);
+  transform: translateY(-50%);
+  box-shadow: 0 10px 18px rgba(15, 23, 42, 0.12);
+  cursor: pointer;
+}
+
+.logjam-track-marker.launch {
+  background: #f59e0b;
+}
+
+.logjam-track-marker.parent {
+  background: #2563eb;
+}
+
+.logjam-track-marker.victim {
+  background: #ef4444;
+}
+
+.logjam-track-marker:hover {
+  box-shadow: 0 14px 24px rgba(15, 23, 42, 0.18);
+}
+
+.logjam-timeline-meta {
+  display: grid;
+  grid-template-columns: auto 1fr auto 1fr;
+  gap: 0.2rem 0.45rem;
+  align-items: baseline;
+  font-size: 0.68rem;
+  color: #64748b;
+}
+
+.logjam-timeline-meta strong {
+  color: #0f172a;
+  font-size: 0.75rem;
+}
+
+.logjam-timeline-meta small {
+  grid-column: 1 / -1;
+  margin-top: 0.12rem;
+  color: #64748b;
+  line-height: 1.22;
+}
+
 @keyframes queuepilot-spin {
   to {
     transform: rotate(360deg);
@@ -698,8 +957,19 @@ select {
   .panel-header,
   .page-toolbar,
   .job-group-head,
-  .watch-card-head {
+  .watch-card-head,
+  .logjam-summary-head,
+  .logjam-timeline-header {
     flex-direction: column;
+  }
+
+  .logjam-summary-grid,
+  .logjam-timeline-row {
+    grid-template-columns: 1fr;
+  }
+
+  .logjam-timeline-axis {
+    margin-left: 0;
   }
 
   .data-table {

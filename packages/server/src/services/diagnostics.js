@@ -14,7 +14,7 @@ const DEFAULT_DRAIN_SLICE_SECONDS = 1800;
 const MAX_DRAIN_SLICE_SECONDS = 4 * 3600;
 
 const HOT_ARTIFACT_LIMIT = 8;
-export const DIAGNOSTICS_ARTIFACT_VERSION = "2";
+export const DIAGNOSTICS_ARTIFACT_VERSION = "3";
 
 const hotArtifacts = new Map();
 const inflightArtifacts = new Map();
@@ -271,6 +271,7 @@ function serializeLogjamArtifact(group, jobsById) {
     blockedChildren: group.pendingCount,
     runningCount: group.runningCount,
     maxWaitHours: group.maxWaitHours,
+    maxElapsedHours: group.maxElapsedHours,
     reasonMix: group.reasonMix,
     blockerCount: group.blockerIds.length,
     originParentCount: group.originParentIds.length,
@@ -374,6 +375,7 @@ function toPublicLogjam(group, sampleLimit = DEFAULT_GRAPH_SAMPLE_LIMIT) {
     blockedChildren: group.blockedChildren,
     runningCount: group.runningCount,
     maxWaitHours: group.maxWaitHours,
+    maxElapsedHours: group.maxElapsedHours,
     reasonMix: group.reasonMix,
     blockerCount: group.blockerCount,
     originParentCount: group.originParentCount,

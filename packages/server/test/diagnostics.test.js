@@ -166,6 +166,7 @@ test("logjam view annotates external queue pressure from other flows", async () 
   assert.equal(logjam.externalQueuePressure.aheadJobs, 3);
   assert.equal(logjam.externalQueuePressure.externalFlows, 3);
   assert.ok(logjam.externalQueuePressure.drainHours > 0);
+  assert.ok(logjam.maxElapsedHours > 0);
   assert.equal(logjam.runningParents[0].externalQueuePressure.aheadJobs, 3);
   assert.match(logjam.message, /higher-priority job\(s\) from other flows ahead in queue/);
 });

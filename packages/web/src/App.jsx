@@ -47,6 +47,7 @@ const fmtHours = (hours) => `${Number(hours || 0).toFixed(hours >= 10 ? 0 : 1)}h
 const fmtRatio = (value) => Number(value || 0).toFixed(2);
 const text = (value) => String(value || "").trim();
 const wckeyLabel = (value) => text(value) || "No WCKey";
+const TIMELINE_WINDOWS = [2, 4, 6, 12, 24, 48, 72];
 
 function groupJobsByFlow(jobs) {
   const groups = new Map();
@@ -60,6 +61,107 @@ function groupJobsByFlow(jobs) {
     label: wckeyLabel(items[0]?.wckey || items[0]?.flowKey || items[0]?.workdirRoot),
     items: [...items].sort((a, b) => (b.waitHours || b.elapsedHours || 0) - (a.waitHours || a.elapsedHours || 0)),
   })).sort((a, b) => b.items.length - a.items.length || a.label.localeCompare(b.label));
+}
+
+function flowAnchorId(index) {
+  return `logjam-flow-${index}`;
+}
+
+function jumpToFlow(anchorId) {
+  if (typeof document === "undefined") return;
+  document.getElementById(anchorId)?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function fmtTimelineOffset(hours) {
+  if (!hours) return "Now";
+  const sign = hours < 0 ? "-" : "+";
+  return `${sign}${fmtCompactDuration(Math.abs(hours) * 3600)}`;
+}
+
+function timelineWindow(hours, cap = 72, fallback = 6) {
+  const safe = Math.max(0, Number(hours) || 0);
+  const capped = Math.min(safe, cap);
+  return TIMELINE_WINDOWS.find((value) => value >= capped) || fallback;
+}
+
+function timelinePosition(hours, pastWindowHours, futureWindowHours) {
+  const min = -pastWindowHours;
+  const max = futureWindowHours;
+  const clamped = Math.min(max, Math.max(min, hours));
+  return ((clamped - min) / (max - min)) * 100;
+}
+
+function timelineBubbleSize(count) {
+  return Math.max(11, Math.min(28, Math.round(8 + Math.sqrt(Math.max(1, count || 1)) * 1.55)));
+}
+
+function expectedWaitHours(group) {
+  return Math.max(0, Number(group?.externalQueuePressure?.drainHours) || 0);
+}
+
+function shortFlowLabel(value, max = 58) {
+  const label = wckeyLabel(value);
+  if (label.length <= max) return label;
+  return `${label.slice(0, max - 1)}…`;
+}
+
+function summarizeBlockerPreview(group) {
+  const blockers = group.externalQueuePressure?.topFlows || [];
+  if (!blockers.length) return "No dominant external blocker flow sampled";
+  const [first, second] = blockers;
+  const firstLabel = `${shortFlowLabel(first.label, 32)} (${first.count})`;
+  if (!second) return firstLabel;
+  return `${firstLabel} and ${shortFlowLabel(second.label, 26)} (${second.count})`;
+}
+
+function aggregateBlockers(groups) {
+  const map = new Map();
+  for (const group of groups) {
+    for (const flow of group.externalQueuePressure?.topFlows || []) {
+      const key = flow.flowKey || flow.label;
+      if (!map.has(key)) {
+        map.set(key, {
+          key,
+          label: flow.label,
+          partition: flow.partition || "",
+          blockingJobs: 0,
+          affectedFlows: 0,
+        });
+      }
+      const current = map.get(key);
+      current.blockingJobs += flow.count || 0;
+      current.affectedFlows += 1;
+    }
+  }
+  return [...map.values()]
+    .sort((a, b) => b.blockingJobs - a.blockingJobs || b.affectedFlows - a.affectedFlows || a.label.localeCompare(b.label))
+    .slice(0, 6);
+}
+
+function buildLogjamOverview(groups) {
+  const totalBlockedChildren = groups.reduce((sum, group) => sum + (group.blockedChildren || 0), 0);
+  const totalRunningParents = groups.reduce((sum, group) => sum + (group.runningParentCount || group.runningCount || 0), 0);
+  const maxProjectedWait = groups.reduce((max, group) => Math.max(max, expectedWaitHours(group)), 0);
+  const maxLaunchAge = groups.reduce((max, group) => Math.max(max, group.maxElapsedHours || 0), 0);
+  return {
+    totalBlockedChildren,
+    totalRunningParents,
+    maxProjectedWait,
+    pastWindowHours: timelineWindow(maxLaunchAge, 72, 72),
+    futureWindowHours: timelineWindow(maxProjectedWait, 24, 24),
+    victims: groups.slice(0, 6),
+    blockers: aggregateBlockers(groups),
+  };
+}
+
+function timelineMarkers(pastWindowHours, futureWindowHours) {
+  return [
+    -pastWindowHours,
+    -pastWindowHours / 2,
+    0,
+    futureWindowHours / 2,
+    futureWindowHours,
+  ].filter((value, index, values) => values.findIndex((candidate) => Math.abs(candidate - value) < 0.001) === index);
 }
 
 function relativeSnapshot(takenAt) {
@@ -409,7 +511,11 @@ function PressurePage({ pressure, loading }) {
 }
 
 function LogjamsPage({ response, loading }) {
-  const groups = response?.data?.items || [];
+  const groups = (response?.data?.items || []).map((group, index) => ({
+    ...group,
+    anchorId: flowAnchorId(index),
+  }));
+  const overview = buildLogjamOverview(groups);
   if (loading && !response) {
     return <LoadingState title="Loading logjams" detail="Tracing blocker chains across the full cached flow set." />;
   }
@@ -419,8 +525,57 @@ function LogjamsPage({ response, loading }) {
   return (
     <div className="stack">
       {loading ? <InlineLoadingNotice label="Refreshing logjams" /> : null}
+      <section className="panel logjam-overview-panel">
+        <div className="panel-header">
+          <div>
+            <h3>Blockers and victims at a glance</h3>
+            <p className="panel-subtitle">The timeline shows when parent flows launched, where they are stuck now, and when their pending child clusters are likely to clear. Click any marker to jump straight to that flow graph.</p>
+          </div>
+          <div className="metric-row">
+            <MetricChip label="Victim flows" value={groups.length} />
+            <MetricChip label="Blocked children" value={overview.totalBlockedChildren} />
+            <MetricChip label="Running parents" value={overview.totalRunningParents} />
+            <MetricChip label="Wait horizon" value={fmtHours(overview.maxProjectedWait || 0)} />
+          </div>
+        </div>
+
+        <div className="logjam-summary-grid">
+          <section className="logjam-summary-card">
+            <div className="logjam-summary-head">
+              <strong>Victims</strong>
+              <span className="detail-chip">{overview.victims.length} flows</span>
+            </div>
+            <div className="logjam-summary-list">
+              {overview.victims.map((group) => (
+                <button key={group.flowKey} className="logjam-summary-item" onClick={() => jumpToFlow(group.anchorId)}>
+                  <span>{shortFlowLabel(group.label, 48)}</span>
+                  <small>{group.blockedChildren} blocked · {fmtHours(expectedWaitHours(group))} wait</small>
+                </button>
+              ))}
+            </div>
+          </section>
+
+          <section className="logjam-summary-card">
+            <div className="logjam-summary-head">
+              <strong>Blockers</strong>
+              <span className="detail-chip">{overview.blockers.length} top flows</span>
+            </div>
+            <div className="logjam-summary-list">
+              {overview.blockers.map((flow) => (
+                <div key={flow.key} className="logjam-summary-item blocker">
+                  <span>{shortFlowLabel(flow.label, 48)}</span>
+                  <small>{flow.blockingJobs} ahead · touches {flow.affectedFlows} victim flow{flow.affectedFlows === 1 ? "" : "s"}</small>
+                </div>
+              ))}
+            </div>
+          </section>
+        </div>
+
+        <LogjamTimeline groups={groups} overview={overview} />
+      </section>
+
       {groups.map((group) => (
-        <section key={group.flowKey} className="panel">
+        <section key={group.flowKey} id={group.anchorId} className="panel logjam-flow-panel">
           <div className="panel-header">
             <div>
               <h3>{wckeyLabel(group.wckey || group.label)}</h3>
@@ -437,6 +592,110 @@ function LogjamsPage({ response, loading }) {
         </section>
       ))}
     </div>
+  );
+}
+
+function LogjamTimeline({ groups, overview }) {
+  const markers = timelineMarkers(overview.pastWindowHours, overview.futureWindowHours);
+  const nowPosition = timelinePosition(0, overview.pastWindowHours, overview.futureWindowHours);
+
+  return (
+    <section className="logjam-timeline-shell">
+      <div className="logjam-timeline-header">
+        <div>
+          <h4>Launch timeline</h4>
+          <p className="panel-subtitle">Left of now shows when parent flows launched. Right of now shows the projected start time for their blocked child clusters after external queue pressure drains.</p>
+        </div>
+        <div className="detail-chip">{fmtTimelineOffset(-overview.pastWindowHours)} to {fmtTimelineOffset(overview.futureWindowHours)}</div>
+      </div>
+
+      <div className="logjam-timeline-axis">
+        {markers.map((marker) => (
+          <div
+            key={marker}
+            className={marker === 0 ? "logjam-axis-tick is-now" : "logjam-axis-tick"}
+            style={{ left: `${timelinePosition(marker, overview.pastWindowHours, overview.futureWindowHours)}%` }}
+          >
+            <span>{fmtTimelineOffset(marker)}</span>
+          </div>
+        ))}
+      </div>
+
+      <div className="logjam-timeline-rows">
+        {groups.map((group) => {
+          const launchHours = Math.max(0, Number(group.maxElapsedHours) || 0);
+          const projectedHours = expectedWaitHours(group);
+          const launchPosition = timelinePosition(-launchHours, overview.pastWindowHours, overview.futureWindowHours);
+          const projectedPosition = timelinePosition(projectedHours, overview.pastWindowHours, overview.futureWindowHours);
+          const parentSize = timelineBubbleSize(group.runningParentCount || group.runningCount || 1);
+          const victimSize = timelineBubbleSize(group.blockedChildren || 1);
+          const pastLeft = Math.min(launchPosition, nowPosition);
+          const pastWidth = Math.max(Math.abs(nowPosition - launchPosition), 0.8);
+          const futureLeft = Math.min(nowPosition, projectedPosition);
+          const futureWidth = Math.max(Math.abs(projectedPosition - nowPosition), projectedHours > 0 ? 0.8 : 0);
+
+          return (
+            <div key={group.flowKey} className="logjam-timeline-row">
+              <button className="logjam-timeline-label" onClick={() => jumpToFlow(group.anchorId)}>
+                <span>{shortFlowLabel(group.label, 52)}</span>
+                <small>{group.blockedChildren} blocked children · {group.runningParentCount || group.runningCount} running parents</small>
+              </button>
+
+              <div className="logjam-timeline-track">
+                <div className="logjam-track-base" />
+                <div className="logjam-track-now" style={{ left: `${nowPosition}%` }} />
+                <div className="logjam-track-span past" style={{ left: `${pastLeft}%`, width: `${pastWidth}%` }} />
+                <div className="logjam-track-span future" style={{ left: `${futureLeft}%`, width: `${futureWidth}%` }} />
+
+                <button
+                  className="logjam-track-marker launch"
+                  style={{
+                    left: `calc(${launchPosition}% - 5px)`,
+                    width: "10px",
+                    height: "10px",
+                  }}
+                  onClick={() => jumpToFlow(group.anchorId)}
+                  aria-label={`Jump to ${group.label} launch details`}
+                  title={`${shortFlowLabel(group.label, 80)} launched ${fmtHours(launchHours)} ago`}
+                />
+
+                <button
+                  className="logjam-track-marker parent"
+                  style={{
+                    left: `calc(${nowPosition}% - ${parentSize / 2}px)`,
+                    width: `${parentSize}px`,
+                    height: `${parentSize}px`,
+                  }}
+                  onClick={() => jumpToFlow(group.anchorId)}
+                  aria-label={`Jump to ${group.label} running parent details`}
+                  title={`${group.runningParentCount || group.runningCount} parent run(s) currently active`}
+                />
+
+                <button
+                  className="logjam-track-marker victim"
+                  style={{
+                    left: `calc(${projectedPosition}% - ${victimSize / 2}px)`,
+                    width: `${victimSize}px`,
+                    height: `${victimSize}px`,
+                  }}
+                  onClick={() => jumpToFlow(group.anchorId)}
+                  aria-label={`Jump to ${group.label} pending child details`}
+                  title={`${group.blockedChildren} blocked child job(s), projected in ${fmtHours(projectedHours)}`}
+                />
+              </div>
+
+              <div className="logjam-timeline-meta">
+                <strong>{fmtHours(launchHours)}</strong>
+                <span>launch age</span>
+                <strong>{fmtHours(projectedHours)}</strong>
+                <span>expected wait</span>
+                <small>{summarizeBlockerPreview(group)}</small>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </section>
   );
 }
 
