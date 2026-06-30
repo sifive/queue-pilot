@@ -8,7 +8,7 @@ export const PENDING_FIELDS = ["Priority", "PendingTime", "Account", "UserName",
 export const JOB_FIELDS = [
   "JobID", "Name", "UserName", "Account", "Partition", "StateCompact", "Reason",
   "Priority", "PendingTime", "TimeUsed", "TimeLimit", "NumCPUs", "MinMemory",
-  "WCKey", "WorkDir", "NodeList",
+  "WCKey", "WorkDir", "NodeList", "Dependency",
 ];
 
 export const fmtO = (fields) => fields.map((f) => `${f}:0`).join(`${SEP},`);

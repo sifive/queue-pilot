@@ -12,6 +12,6 @@
     "dev:mcp": "npm -w packages/mcp run dev",
     "start": "npm -w packages/server run start",
     "build": "npm -w packages/web run build",
-    "test": "node --test packages/shared packages/server"
+    "test": "node --test packages/shared/test/*.test.js packages/server/test/*.test.js"
   }
 }

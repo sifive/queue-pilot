@@ -1,6 +1,6 @@
 import { config } from "./config.js";
 import { pressureSummary, bucketize } from "./services/queue.js";
-import { diagnoseJob, detectFanoutLogjam } from "./services/diagnostics.js";
+import { buildDiagnosticsDataset, diagnoseJob, detectFanoutLogjam } from "./services/diagnostics.js";
 import { estimateHeuristic, makeBucketStatsLookup } from "./services/eta.js";
 import { makeWatchlist } from "./services/watchlist.js";
 
@@ -52,10 +52,7 @@ export function registerRoutes(app, ctx) {
     if (req.query.user) jobs = jobs.filter((j) => j.user === req.query.user);
     if (req.query.wckey) jobs = jobs.filter((j) => (j.wckey || "").includes(req.query.wckey));
     if (req.query.workdir) jobs = jobs.filter((j) => (j.workdir || "").includes(req.query.workdir));
-    return {
-      jobs: jobs.map((j) => ({ jobId: j.jobId, state: j.state, ...diagnoseJob(j) })),
-      logjams: detectFanoutLogjam(jobs),
-    };
+    return buildDiagnosticsDataset(jobs);
   });
 
   app.get("/api/eta/:id", async (req) => {

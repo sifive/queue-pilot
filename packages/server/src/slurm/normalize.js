@@ -114,6 +114,7 @@ export function normalizeJob(raw, cluster) {
     wckey: stringField(raw.WCKey, raw.wckey),
     workdir: stringField(raw.WorkDir, raw.current_working_directory, raw.work_dir),
     nodelist: stringField(raw.NodeList, raw.nodes, raw.node_list),
+    dependency: stringField(raw.Dependency, raw.dependencies, raw.dependency),
   };
 }
 
