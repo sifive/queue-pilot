@@ -9,13 +9,15 @@ export function snapshotCluster({ adapter, db, cluster, onSnapshot }) {
   return adapter.listJobs({ cluster, states: "PD,R" }).then((jobs) => {
     const pend = jobs.filter((j) => /^(PD|PENDING)/i.test(j.state)).length;
     const run = jobs.length - pend;
+    const takenAt = Math.floor(Date.now() / 1000);
     const info = db.prepare("INSERT INTO snapshot(cluster,taken_at,pending_count,running_count,raw_json) VALUES(?,?,?,?,?)")
-      .run(cluster, Math.floor(Date.now() / 1000), pend, run, JSON.stringify({ jobs }));
+      .run(cluster, takenAt, pend, run, JSON.stringify({ jobs }));
     const stmt = db.prepare(`INSERT INTO job_sample(snapshot_id,job_id,cluster,name,user,account,partition,state,reason,priority,pending_seconds,elapsed_seconds,timelimit_seconds,req_cpus,req_mem,wckey,workdir,nodelist) VALUES (@sid,@jobId,@cluster,@name,@user,@account,@partition,@state,@reason,@priority,@pendingSeconds,@elapsedSeconds,@timelimitSeconds,@reqCpus,@reqMem,@wckey,@workdir,@nodelist)`);
     const tx = db.transaction((rows) => rows.forEach((r) => stmt.run({ sid: info.lastInsertRowid, ...r })));
     tx(jobs);
-    onSnapshot?.({ cluster, jobs });
-    return { cluster, jobs };
+    const snapshot = { id: Number(info.lastInsertRowid), cluster, taken_at: takenAt };
+    onSnapshot?.({ cluster, jobs, snapshot });
+    return { cluster, jobs, snapshot };
   });
 }
 

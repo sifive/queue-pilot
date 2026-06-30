@@ -1,7 +1,14 @@
+import { createHash } from "node:crypto";
 import { config } from "./config.js";
-import { latestSnapshotJobs } from "./db.js";
+import { latestSnapshotInfo, latestSnapshotJobs, snapshotJobsById } from "./db.js";
 import { bucketize, summarizePressureJobs } from "./services/queue.js";
-import { buildDiagnosticsView, diagnoseJob, detectFanoutLogjam } from "./services/diagnostics.js";
+import {
+  buildDiagnosticsArtifact,
+  diagnoseJob,
+  detectFanoutLogjam,
+  getOrBuildDiagnosticsArtifact,
+  renderDiagnosticsResponse,
+} from "./services/diagnostics.js";
 import { estimateHeuristic, makeBucketStatsLookup } from "./services/eta.js";
 import { makeWatchlist } from "./services/watchlist.js";
 
@@ -10,6 +17,23 @@ export function registerRoutes(app, ctx) {
   const watch = makeWatchlist(db);
   const cl = (q) => q.cluster || config.defaultCluster;
   const stats = makeBucketStatsLookup(db);
+  const etagForDiagnose = ({ cluster, snapshotId, artifactVersion, query }) => {
+    const digest = createHash("sha1").update(JSON.stringify({
+      cluster,
+      snapshotId: snapshotId || "live",
+      artifactVersion,
+      section: query.section || "summary",
+      view: query.view || "graph",
+      search: query.search || "",
+      user: query.user || "",
+      wckey: query.wckey || "",
+      workdir: query.workdir || "",
+      jobLimit: query.jobLimit || "",
+      jobOffset: query.jobOffset || "",
+      sampleLimit: query.sampleLimit || "",
+    })).digest("hex");
+    return `"${digest}"`;
+  };
   const currentJobs = async (cluster) => {
     const snapshotData = latestSnapshotJobs(db, cluster);
     if (snapshotData.jobs.length > 0) return snapshotData;
@@ -57,26 +81,54 @@ export function registerRoutes(app, ctx) {
     return { job, diagnosis: diagnoseJob(job), eta: etaForJob(job, jobs) };
   });
 
-  app.get("/api/diagnose", async (req) => {
+  app.get("/api/diagnose", async (req, reply) => {
     const cluster = cl(req.query);
-    const { snapshot, jobs: current } = await currentJobs(cluster);
-    let jobs = current;
-    if (req.query.user) jobs = jobs.filter((j) => j.user === req.query.user);
-    if (req.query.wckey) jobs = jobs.filter((j) => (j.wckey || "").includes(req.query.wckey));
-    if (req.query.workdir) jobs = jobs.filter((j) => (j.workdir || "").includes(req.query.workdir));
-    const section = req.query.section || "summary";
+    const snapshot = latestSnapshotInfo(db, cluster);
+    const query = {
+      section: req.query.section || "summary",
+      view: req.query.view,
+      search: req.query.search,
+      jobLimit: req.query.jobLimit,
+      jobOffset: req.query.jobOffset,
+      sampleLimit: req.query.sampleLimit,
+    };
+
+    const baseArtifact = snapshot?.id
+      ? await getOrBuildDiagnosticsArtifact({
+        db,
+        cluster,
+        snapshot,
+        loadJobs: () => snapshotJobsById(db, snapshot.id),
+      })
+      : buildDiagnosticsArtifact(await adapter.listJobs({ cluster, states: "PD,R" }));
+    let artifact = baseArtifact;
+    const hasPrefilters = Boolean(req.query.user || req.query.wckey || req.query.workdir);
+    if (hasPrefilters) {
+      const filteredJobs = (baseArtifact.jobs?.items || []).filter((job) => {
+        if (req.query.user && job.user !== req.query.user) return false;
+        if (req.query.wckey && !(job.wckey || "").includes(req.query.wckey)) return false;
+        if (req.query.workdir && !(job.workdir || "").includes(req.query.workdir)) return false;
+        return true;
+      });
+      artifact = buildDiagnosticsArtifact(filteredJobs);
+    }
+
+    const etag = etagForDiagnose({
+      cluster,
+      snapshotId: snapshot?.id || null,
+      artifactVersion: artifact.version,
+      query: req.query,
+    });
+    reply.header("Cache-Control", "private, max-age=0, must-revalidate");
+    reply.header("ETag", etag);
+    if (req.headers["if-none-match"] === etag) return reply.code(304).send();
+
     return {
       cluster,
       snapshotTakenAt: snapshot?.taken_at || Math.floor(Date.now() / 1000),
-      ...buildDiagnosticsView(jobs, {
-        section,
-        view: req.query.view,
-        search: req.query.search,
-        groupLimit: req.query.groupLimit,
-        jobLimit: req.query.jobLimit,
-        jobOffset: req.query.jobOffset,
-        sampleLimit: req.query.sampleLimit,
-      }),
+      snapshotId: snapshot?.id || null,
+      artifactVersion: artifact.version,
+      ...renderDiagnosticsResponse(artifact, query),
     };
   });
 

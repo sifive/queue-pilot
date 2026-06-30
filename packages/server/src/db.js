@@ -31,8 +31,17 @@ export function openDb() {
     p50_wait INTEGER, p90_wait INTEGER, p50_elapsed INTEGER, p90_elapsed INTEGER,
     n INTEGER, updated_at INTEGER,
     PRIMARY KEY(cluster, account, partition, reason, size_bucket));
+  CREATE TABLE IF NOT EXISTS diagnostics_cache(
+    cluster TEXT PRIMARY KEY,
+    snapshot_id INTEGER NOT NULL,
+    version TEXT NOT NULL,
+    built_at INTEGER NOT NULL,
+    summary_json TEXT NOT NULL,
+    graph_json TEXT NOT NULL,
+    jobs_json TEXT NOT NULL);
   CREATE INDEX IF NOT EXISTS idx_sample_snap ON job_sample(snapshot_id);
   CREATE INDEX IF NOT EXISTS idx_hist_bucket ON job_history(account, partition);
+  CREATE INDEX IF NOT EXISTS idx_diag_cache_snap ON diagnostics_cache(snapshot_id);
   `);
   return db;
 }
@@ -47,6 +56,32 @@ export function latestSnapshot(db, cluster) {
   `).get(cluster) || null;
 }
 
+export function latestSnapshotInfo(db, cluster) {
+  return db.prepare(`
+    SELECT id, cluster, taken_at, pending_count, running_count
+    FROM snapshot
+    WHERE cluster = ?
+    ORDER BY id DESC
+    LIMIT 1
+  `).get(cluster) || null;
+}
+
+export function snapshotJobsById(db, snapshotId) {
+  const row = db.prepare(`
+    SELECT raw_json
+    FROM snapshot
+    WHERE id = ?
+    LIMIT 1
+  `).get(snapshotId);
+  if (!row) return [];
+  try {
+    const parsed = JSON.parse(row.raw_json || "{}");
+    return Array.isArray(parsed.jobs) ? parsed.jobs : [];
+  } catch {
+    return [];
+  }
+}
+
 export function latestSnapshotJobs(db, cluster) {
   const snapshot = latestSnapshot(db, cluster);
   if (!snapshot) return { snapshot: null, jobs: [] };
@@ -56,4 +91,26 @@ export function latestSnapshotJobs(db, cluster) {
   } catch {
     return { snapshot, jobs: [] };
   }
+}
+
+export function readDiagnosticsCache(db, cluster) {
+  return db.prepare(`
+    SELECT cluster, snapshot_id, version, built_at, summary_json, graph_json, jobs_json
+    FROM diagnostics_cache
+    WHERE cluster = ?
+  `).get(cluster) || null;
+}
+
+export function writeDiagnosticsCache(db, entry) {
+  db.prepare(`
+    INSERT INTO diagnostics_cache(cluster, snapshot_id, version, built_at, summary_json, graph_json, jobs_json)
+    VALUES (@cluster, @snapshotId, @version, @builtAt, @summaryJson, @graphJson, @jobsJson)
+    ON CONFLICT(cluster) DO UPDATE SET
+      snapshot_id=excluded.snapshot_id,
+      version=excluded.version,
+      built_at=excluded.built_at,
+      summary_json=excluded.summary_json,
+      graph_json=excluded.graph_json,
+      jobs_json=excluded.jobs_json
+  `).run(entry);
 }

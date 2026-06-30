@@ -1,8 +1,33 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import Database from "better-sqlite3";
 
 import { MockAdapter } from "../src/slurm/mock.js";
-import { buildDiagnosticsDataset, buildDiagnosticsView, detectFanoutLogjam, diagnoseJob, parseDependencyIds } from "../src/services/diagnostics.js";
+import {
+  DIAGNOSTICS_ARTIFACT_VERSION,
+  buildDiagnosticsDataset,
+  buildDiagnosticsView,
+  detectFanoutLogjam,
+  diagnoseJob,
+  getOrBuildDiagnosticsArtifact,
+  parseDependencyIds,
+} from "../src/services/diagnostics.js";
+
+function openDiagnosticsCacheDb() {
+  const db = new Database(":memory:");
+  db.exec(`
+    CREATE TABLE diagnostics_cache(
+      cluster TEXT PRIMARY KEY,
+      snapshot_id INTEGER NOT NULL,
+      version TEXT NOT NULL,
+      built_at INTEGER NOT NULL,
+      summary_json TEXT NOT NULL,
+      graph_json TEXT NOT NULL,
+      jobs_json TEXT NOT NULL
+    );
+  `);
+  return db;
+}
 
 test("fan-out detector finds pending children behind a running parent", async () => {
   const adapter = new MockAdapter();
@@ -51,6 +76,42 @@ test("diagnostics dataset groups jobs by flow and exposes blockers", async () =>
   assert.equal(dependentJob.blockerSource, "dependency");
   assert.equal(flowGroup.pendingCount, 2);
   assert.deepEqual(flowGroup.originParentIds, ["60000001", "60000002"]);
+});
+
+test("graph payloads are sampled with explicit count fields", async () => {
+  const adapter = new MockAdapter();
+  const jobs = await adapter.listJobs({ states: "PD,R" });
+  jobs.push(
+    ...Array.from({ length: 12 }).map((_, index) => ({
+      jobId: `7100${index}`,
+      cluster: jobs[0].cluster,
+      name: `sample-${index}`,
+      user: "jenkins-verif",
+      account: "verif_bulk",
+      partition: "standard_scl",
+      state: "R",
+      reason: "",
+      priority: 100,
+      pendingSeconds: 0,
+      elapsedSeconds: 100 + index,
+      timelimitSeconds: 3600,
+      reqCpus: 1,
+      reqMem: "4G",
+      wckey: ":federation-pull-requests-Base-Tests/7748/",
+      workdir: `/scratch/jenkins/archived-builds/federation/builds/sample-${index}`,
+      nodelist: "",
+      dependency: "",
+    }))
+  );
+
+  const logjamView = buildDiagnosticsView(jobs, { section: "logjams", sampleLimit: 99 });
+  const [group] = logjamView.data.items;
+
+  assert.ok(group.runningParentCount >= group.runningParents.length);
+  assert.ok(group.originParentCount >= group.originParents.length);
+  assert.ok(group.runningParents.length <= 8);
+  assert.ok(group.originParents.length <= 8);
+  assert.ok(group.children.length <= 8);
 });
 
 test("logjam view annotates external queue pressure from other flows", async () => {
@@ -107,4 +168,41 @@ test("logjam view annotates external queue pressure from other flows", async () 
   assert.ok(logjam.externalQueuePressure.drainHours > 0);
   assert.equal(logjam.runningParents[0].externalQueuePressure.aheadJobs, 3);
   assert.match(logjam.message, /higher-priority job\(s\) from other flows ahead in queue/);
+});
+
+test("snapshot-keyed diagnostics artifact cache persists and invalidates by snapshot id", async () => {
+  const adapter = new MockAdapter();
+  const jobs = await adapter.listJobs({ states: "PD,R" });
+  const db = openDiagnosticsCacheDb();
+
+  const artifact1 = await getOrBuildDiagnosticsArtifact({
+    db,
+    cluster: "compute1",
+    snapshot: { id: 101 },
+    jobs,
+  });
+  assert.equal(artifact1.version, DIAGNOSTICS_ARTIFACT_VERSION);
+  assert.equal(artifact1.summary.totalJobs, jobs.length);
+
+  const cachedRow = db.prepare("SELECT snapshot_id, version FROM diagnostics_cache WHERE cluster='compute1'").get();
+  assert.equal(cachedRow.snapshot_id, 101);
+  assert.equal(cachedRow.version, DIAGNOSTICS_ARTIFACT_VERSION);
+
+  const artifactSameSnapshot = await getOrBuildDiagnosticsArtifact({
+    db,
+    cluster: "compute1",
+    snapshot: { id: 101 },
+    jobs: [],
+  });
+  assert.equal(artifactSameSnapshot.summary.totalJobs, jobs.length);
+
+  const artifactNewSnapshot = await getOrBuildDiagnosticsArtifact({
+    db,
+    cluster: "compute1",
+    snapshot: { id: 102 },
+    jobs: [],
+  });
+  assert.equal(artifactNewSnapshot.summary.totalJobs, 0);
+  const updatedRow = db.prepare("SELECT snapshot_id FROM diagnostics_cache WHERE cluster='compute1'").get();
+  assert.equal(updatedRow.snapshot_id, 102);
 });

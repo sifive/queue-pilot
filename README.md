@@ -39,6 +39,16 @@ The web app currently exposes these pages:
 - `Running`: aggregated graph or list view of active jobs by flow and WCKey.
 - `Watchlist`: saved matchers with diagnosis and ETA context.
 
+### UI Snapshots
+
+Pressure view:
+
+![Queue Pilot Pressure View](docs/images/pressure-page.png)
+
+Logjams view:
+
+![Queue Pilot Logjams View](docs/images/logjams-page.png)
+
 ## Repo Layout
 
 - `packages/shared` - REASON taxonomy, ETA math, shared types and helpers

@@ -1,7 +1,23 @@
 import { classifyReason } from "@queuepilot/shared";
+import { readDiagnosticsCache, writeDiagnosticsCache } from "../db.js";
 
 const PENDING_RE = /^(PD|PENDING)/i;
 const RUNNING_RE = /^(R|RUNNING)/i;
+const NULLISH_FLOW_VALUES = new Set(["", "(null)", "null", "none", "/root"]);
+
+const DEFAULT_JOB_LIMIT = 200;
+const MAX_JOB_LIMIT = 500;
+const DEFAULT_GRAPH_SAMPLE_LIMIT = 8;
+const INTERNAL_GRAPH_SAMPLE_LIMIT = 8;
+
+const DEFAULT_DRAIN_SLICE_SECONDS = 1800;
+const MAX_DRAIN_SLICE_SECONDS = 4 * 3600;
+
+const HOT_ARTIFACT_LIMIT = 8;
+export const DIAGNOSTICS_ARTIFACT_VERSION = "2";
+
+const hotArtifacts = new Map();
+const inflightArtifacts = new Map();
 
 const roundHours = (seconds = 0) => Math.round(((seconds || 0) / 3600) * 10) / 10;
 const uniq = (values) => [...new Set(values.filter(Boolean))];
@@ -9,11 +25,6 @@ const byPendingAge = (a, b) => (b.pendingSeconds || 0) - (a.pendingSeconds || 0)
 const byElapsedAge = (a, b) => (b.elapsedSeconds || 0) - (a.elapsedSeconds || 0) || String(a.jobId).localeCompare(String(b.jobId));
 const byCount = (a, b) => (b.pendingCount || b.runningCount || b.jobCount || 0) - (a.pendingCount || a.runningCount || a.jobCount || 0)
   || (b.maxWaitHours || b.maxElapsedHours || 0) - (a.maxWaitHours || a.maxElapsedHours || 0);
-const DEFAULT_JOB_LIMIT = 200;
-const DEFAULT_GRAPH_SAMPLE_LIMIT = 8;
-const NULLISH_FLOW_VALUES = new Set(["", "(null)", "null", "none", "/root"]);
-const DEFAULT_DRAIN_SLICE_SECONDS = 1800;
-const MAX_DRAIN_SLICE_SECONDS = 4 * 3600;
 
 function avg(values) {
   if (values.length === 0) return 0;
@@ -23,6 +34,12 @@ function avg(values) {
 function mean(values) {
   if (values.length === 0) return 0;
   return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function clampInt(value, fallback, max = fallback) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return Math.min(parsed, max);
 }
 
 function flowIdentity(job) {
@@ -54,8 +71,7 @@ function countAheadFlows(jobs = []) {
     }
     byFlow.get(key).count += 1;
   }
-  return [...byFlow.values()]
-    .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+  return [...byFlow.values()].sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
 }
 
 function summarizeQueuePressure(queuePressure) {
@@ -89,10 +105,6 @@ function summarizeJob(job, extra = {}) {
     account: job.account,
     partition: job.partition,
     category: job.category,
-    wckey: job.wckey,
-    workdir: job.workdir,
-    waitHours: job.waitHours,
-    elapsedHours: job.elapsedHours,
     ...extra,
   };
 }
@@ -130,59 +142,6 @@ function detailedJob(job, jobsById) {
   };
 }
 
-function searchTextForJob(job) {
-  return [
-    job.jobId,
-    job.name,
-    job.user,
-    job.account,
-    job.partition,
-    job.state,
-    job.reason,
-    job.wckey,
-    job.flowKey,
-    job.workdir,
-    job.dependency,
-    ...(job.blockerIds || []),
-    ...(job.originParentIds || []),
-  ].join(" ").toLowerCase();
-}
-
-function matchesJobSearch(job, searchTerm) {
-  if (!searchTerm) return true;
-  return searchTextForJob(job).includes(searchTerm);
-}
-
-function matchesGroupSearch(group, searchTerm, jobsById) {
-  if (!searchTerm) return true;
-  const direct = [
-    group.label,
-    group.flowKey,
-    group.wckey,
-    group.workdirRoot,
-    ...group.users,
-    ...group.accounts,
-    ...group.partitions,
-    ...group.blockers.map((parent) => `${parent.jobId} ${parent.name}`),
-    ...group.originParents.map((parent) => `${parent.jobId} ${parent.name}`),
-  ].join(" ").toLowerCase();
-  if (direct.includes(searchTerm)) return true;
-  return (group.jobIds || []).some((jobId) => {
-    const job = jobsById.get(String(jobId));
-    return job ? matchesJobSearch(job, searchTerm) : false;
-  });
-}
-
-function clampInt(value, fallback, max = fallback) {
-  const parsed = Number.parseInt(String(value ?? ""), 10);
-  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
-  return Math.min(parsed, max);
-}
-
-function graphJobSamples(jobIds, jobsById, limit = DEFAULT_GRAPH_SAMPLE_LIMIT) {
-  return jobIds.slice(0, limit).map((jobId) => jobsById.get(String(jobId))).filter(Boolean).map(summarizeJob);
-}
-
 function compactList(values, limit = 3) {
   const items = values.filter(Boolean);
   if (items.length <= limit) return items.join(", ");
@@ -206,7 +165,55 @@ export function isControlPlaneGroup(group) {
     || (isNullishFlowValue(label) && (workdirRoot === "/root" || isNullishFlowValue(flowKey) || isNullishFlowValue(wckey)));
 }
 
-function serializeGroup(group, jobsById, sampleLimit = DEFAULT_GRAPH_SAMPLE_LIMIT) {
+function searchTextForJob(job) {
+  return [
+    job.jobId,
+    job.name,
+    job.user,
+    job.account,
+    job.partition,
+    job.state,
+    job.reason,
+    job.wckey,
+    job.flowKey,
+    job.workdir,
+    job.dependency,
+    ...(job.blockerIds || []),
+    ...(job.originParentIds || []),
+  ].join(" ").toLowerCase();
+}
+
+function matchesJobSearch(job, searchTerm) {
+  if (!searchTerm) return true;
+  return (job.searchText || "").includes(searchTerm);
+}
+
+function matchesGroupSearch(group, searchTerm, matchedJobIds = null) {
+  if (!searchTerm) return true;
+  if ((group.searchText || "").includes(searchTerm)) return true;
+  if (!matchedJobIds || matchedJobIds.size === 0) return false;
+  return (group.jobIds || []).some((jobId) => matchedJobIds.has(String(jobId)));
+}
+
+function groupSummarySearchText(group) {
+  return [
+    group.label,
+    group.flowKey,
+    group.wckey,
+    group.workdirRoot,
+    ...group.users,
+    ...group.accounts,
+    ...group.partitions,
+    ...group.blockerIds,
+    ...group.originParentIds,
+  ].join(" ").toLowerCase();
+}
+
+function sampleJobsByIds(jobIds, jobsById, limit = INTERNAL_GRAPH_SAMPLE_LIMIT, mapFn = summarizeJob) {
+  return jobIds.slice(0, limit).map((jobId) => jobsById.get(String(jobId))).filter(Boolean).map(mapFn);
+}
+
+function serializeGroupArtifact(group, jobsById) {
   return {
     flowKey: group.flowKey,
     label: group.label,
@@ -221,18 +228,166 @@ function serializeGroup(group, jobsById, sampleLimit = DEFAULT_GRAPH_SAMPLE_LIMI
     avgElapsedHours: group.avgElapsedHours,
     reasonMix: group.reasonMix,
     blockerSource: group.blockerSource,
-    blockers: group.blockers,
-    originParents: group.originParents,
-    pendingJobs: graphJobSamples(group.pendingJobIds, jobsById, sampleLimit),
-    runningJobs: graphJobSamples(group.runningJobIds, jobsById, sampleLimit),
+    blockerCount: group.blockerIds.length,
+    originParentCount: group.originParentIds.length,
+    blockers: sampleJobsByIds(group.blockerIds, jobsById),
+    originParents: sampleJobsByIds(group.originParentIds, jobsById),
+    pendingJobs: sampleJobsByIds(group.pendingJobIds, jobsById),
+    runningJobs: sampleJobsByIds(group.runningJobIds, jobsById),
     userLabel: compactList(group.users),
     accountLabel: compactList(group.accounts),
     partitionLabel: compactList(group.partitions),
     isControlPlane: isControlPlaneGroup(group),
+    searchText: group.searchText,
+    jobIds: [...group.jobIds],
+    blockerIds: [...group.blockerIds],
+    originParentIds: [...group.originParentIds],
+    pendingJobIds: [...group.pendingJobIds],
+    runningJobIds: [...group.runningJobIds],
   };
 }
 
-function diagnosticsSummary(annotatedJobs, flowGroups, logjams) {
+function serializeLogjamArtifact(group, jobsById) {
+  const parentQueuePressure = new Map((group.parentQueuePressure || []).map((pressure) => [String(pressure.jobId), pressure]));
+  const compactParentPressure = (pressure) => ({
+    aheadJobs: pressure?.aheadJobs || 0,
+    drainHours: roundHours(pressure?.drainSeconds || 0),
+  });
+  const summarizeParentWithPressure = (jobId) => {
+    const job = jobsById.get(String(jobId));
+    if (!job) return null;
+    return {
+      jobId: job.jobId,
+      name: job.name,
+      state: job.state,
+      externalQueuePressure: compactParentPressure(parentQueuePressure.get(String(jobId)) || group.externalQueuePressure),
+    };
+  };
+  return {
+    flowKey: group.flowKey,
+    label: group.label,
+    wckey: group.wckey,
+    workdirRoot: group.workdirRoot,
+    blockedChildren: group.pendingCount,
+    runningCount: group.runningCount,
+    maxWaitHours: group.maxWaitHours,
+    reasonMix: group.reasonMix,
+    blockerCount: group.blockerIds.length,
+    originParentCount: group.originParentIds.length,
+    runningParentCount: group.runningJobIds.length,
+    originParents: group.originParentIds.slice(0, INTERNAL_GRAPH_SAMPLE_LIMIT).map(summarizeParentWithPressure).filter(Boolean),
+    runningParents: group.runningJobIds.slice(0, INTERNAL_GRAPH_SAMPLE_LIMIT).map(summarizeParentWithPressure).filter(Boolean),
+    children: sampleJobsByIds(group.pendingJobIds, jobsById),
+    externalQueuePressure: summarizeQueuePressure(group.externalQueuePressure),
+    message: group.externalQueuePressure?.aheadJobs
+      ? `Flow ${group.label} has ${group.runningCount} active parent run(s), ${group.pendingCount} pending child job(s), and ${group.externalQueuePressure.aheadJobs} higher-priority job(s) from other flows ahead in queue.`
+      : `Flow ${group.label} has ${group.runningCount} active parent run(s) with ${group.pendingCount} pending child job(s).`,
+    isControlPlane: isControlPlaneGroup(group),
+    searchText: group.searchText,
+    jobIds: [...group.jobIds],
+    blockerIds: [...group.blockerIds],
+    originParentIds: [...group.originParentIds],
+    pendingJobIds: [...group.pendingJobIds],
+    runningJobIds: [...group.runningJobIds],
+  };
+}
+
+function toPublicGroup(group, options = {}) {
+  const normalized = typeof options === "number" ? { sampleLimit: options } : options;
+  const sampleLimit = normalized.sampleLimit ?? DEFAULT_GRAPH_SAMPLE_LIMIT;
+  const mode = normalized.mode || "full";
+
+  const base = {
+    flowKey: group.flowKey,
+    label: group.label,
+    wckey: group.wckey,
+    workdirRoot: group.workdirRoot,
+    jobCount: group.jobCount,
+    pendingCount: group.pendingCount,
+    runningCount: group.runningCount,
+    maxWaitHours: group.maxWaitHours,
+    avgWaitHours: group.avgWaitHours,
+    maxElapsedHours: group.maxElapsedHours,
+    avgElapsedHours: group.avgElapsedHours,
+    isControlPlane: group.isControlPlane,
+  };
+
+  if (mode === "running") {
+    return {
+      ...base,
+      originParentCount: group.originParentCount,
+      originParents: group.originParents.slice(0, sampleLimit),
+      runningJobs: group.runningJobs.slice(0, sampleLimit),
+      userLabel: group.userLabel,
+    };
+  }
+
+  if (mode === "pending") {
+    return {
+      ...base,
+      reasonMix: group.reasonMix,
+      blockerSource: group.blockerSource,
+      blockerCount: group.blockerCount,
+      originParentCount: group.originParentCount,
+      blockers: group.blockers.slice(0, sampleLimit),
+      originParents: group.originParents.slice(0, sampleLimit),
+      pendingJobs: group.pendingJobs.slice(0, sampleLimit),
+      userLabel: group.userLabel,
+      accountLabel: group.accountLabel,
+      partitionLabel: group.partitionLabel,
+    };
+  }
+
+  if (mode === "control") {
+    return {
+      ...base,
+      reasonMix: group.reasonMix,
+      originParentCount: group.originParentCount,
+      originParents: group.originParents.slice(0, sampleLimit),
+      pendingJobs: group.pendingJobs.slice(0, sampleLimit),
+      runningJobs: group.runningJobs.slice(0, sampleLimit),
+    };
+  }
+
+  return {
+    ...base,
+    reasonMix: group.reasonMix,
+    blockerSource: group.blockerSource,
+    blockerCount: group.blockerCount,
+    originParentCount: group.originParentCount,
+    blockers: group.blockers.slice(0, sampleLimit),
+    originParents: group.originParents.slice(0, sampleLimit),
+    pendingJobs: group.pendingJobs.slice(0, sampleLimit),
+    runningJobs: group.runningJobs.slice(0, sampleLimit),
+    userLabel: group.userLabel,
+    accountLabel: group.accountLabel,
+    partitionLabel: group.partitionLabel,
+  };
+}
+
+function toPublicLogjam(group, sampleLimit = DEFAULT_GRAPH_SAMPLE_LIMIT) {
+  return {
+    flowKey: group.flowKey,
+    label: group.label,
+    wckey: group.wckey,
+    workdirRoot: group.workdirRoot,
+    blockedChildren: group.blockedChildren,
+    runningCount: group.runningCount,
+    maxWaitHours: group.maxWaitHours,
+    reasonMix: group.reasonMix,
+    blockerCount: group.blockerCount,
+    originParentCount: group.originParentCount,
+    runningParentCount: group.runningParentCount,
+    originParents: group.originParents.slice(0, sampleLimit),
+    runningParents: group.runningParents.slice(0, sampleLimit),
+    children: group.children.slice(0, sampleLimit),
+    externalQueuePressure: group.externalQueuePressure,
+    message: group.message,
+    isControlPlane: group.isControlPlane,
+  };
+}
+
+function diagnosticsSummary(annotatedJobs, flowGroups, logjams, controlGroups) {
   const pendingJobs = annotatedJobs.filter((job) => job.isPending);
   const runningJobs = annotatedJobs.filter((job) => job.isRunning);
   return {
@@ -241,6 +396,7 @@ function diagnosticsSummary(annotatedJobs, flowGroups, logjams) {
     runningCount: runningJobs.length,
     logjamCount: logjams.length,
     uniqueFlows: flowGroups.length,
+    controlPlaneFlows: controlGroups.length,
   };
 }
 
@@ -261,33 +417,39 @@ function pageSummary(groups, jobs, mode) {
   };
 }
 
-function serializeLogjam(group, jobsById, sampleLimit = DEFAULT_GRAPH_SAMPLE_LIMIT) {
-  const parentQueuePressure = new Map((group.parentQueuePressure || []).map((pressure) => [String(pressure.jobId), pressure]));
-  const summarizeParentWithPressure = (jobId) => {
-    const job = jobsById.get(String(jobId));
-    if (!job) return null;
-    return summarizeJob(job, {
-      externalQueuePressure: summarizeQueuePressure(parentQueuePressure.get(String(jobId)) || group.externalQueuePressure),
-    });
-  };
-  return {
-    flowKey: group.flowKey,
-    label: group.label,
-    wckey: group.wckey,
-    workdirRoot: group.workdirRoot,
-    blockedChildren: group.pendingCount,
-    runningCount: group.runningCount,
-    maxWaitHours: group.maxWaitHours,
-    reasonMix: group.reasonMix,
-    originParents: uniq(group.originParentIds).map(summarizeParentWithPressure).filter(Boolean),
-    runningParents: group.runningJobIds.map(summarizeParentWithPressure).filter(Boolean),
-    children: graphJobSamples(group.pendingJobIds, jobsById, sampleLimit),
-    externalQueuePressure: summarizeQueuePressure(group.externalQueuePressure),
-    message: group.externalQueuePressure?.aheadJobs
-      ? `Flow ${group.label} has ${group.runningCount} active parent run(s), ${group.pendingCount} pending child job(s), and ${group.externalQueuePressure.aheadJobs} higher-priority job(s) from other flows ahead in queue.`
-      : `Flow ${group.label} has ${group.runningCount} active parent run(s) with ${group.pendingCount} pending child job(s).`,
-    isControlPlane: isControlPlaneGroup(group),
-  };
+function toArtifactCacheKey(cluster, snapshotId, version = DIAGNOSTICS_ARTIFACT_VERSION) {
+  return `${cluster}:${snapshotId}:${version}`;
+}
+
+function getHotArtifact(cacheKey) {
+  if (!hotArtifacts.has(cacheKey)) return null;
+  const value = hotArtifacts.get(cacheKey);
+  hotArtifacts.delete(cacheKey);
+  hotArtifacts.set(cacheKey, value);
+  return value;
+}
+
+function setHotArtifact(cacheKey, artifact) {
+  hotArtifacts.delete(cacheKey);
+  hotArtifacts.set(cacheKey, artifact);
+  while (hotArtifacts.size > HOT_ARTIFACT_LIMIT) {
+    const oldest = hotArtifacts.keys().next().value;
+    hotArtifacts.delete(oldest);
+  }
+}
+
+function hydrateArtifactFromRow(row) {
+  try {
+    return {
+      version: String(row.version),
+      builtAt: Number(row.built_at) || Math.floor(Date.now() / 1000),
+      summary: JSON.parse(row.summary_json || "{}"),
+      graph: JSON.parse(row.graph_json || "{}"),
+      jobs: JSON.parse(row.jobs_json || "{}"),
+    };
+  } catch {
+    return null;
+  }
 }
 
 export function diagnoseJob(job, opts = {}) {
@@ -336,6 +498,7 @@ export function annotateJobs(jobs) {
       blockerIds: [],
       blockerSource: "none",
       workdirHref: job.workdir ? `file://${encodeURI(job.workdir)}` : "",
+      searchText: "",
     };
   });
 
@@ -367,6 +530,7 @@ export function annotateJobs(jobs) {
         job.blockerIds = runningOrigins.filter((candidate) => candidate.jobId !== job.jobId).map((candidate) => candidate.jobId);
         job.blockerSource = job.blockerIds.length > 0 ? "origin_flow" : "none";
       }
+      job.searchText = searchTextForJob(job);
     }
   }
 
@@ -418,18 +582,13 @@ function buildFlowGroups(annotatedJobs) {
     const runningJobs = jobs.filter((job) => job.isRunning).sort(byElapsedAge);
     const blockerIds = uniq(pendingJobs.flatMap((job) => job.blockerIds));
     const originParentIds = uniq(jobs.flatMap((job) => job.originParentIds));
-    const blockers = blockerIds.map((id) => byId.get(String(id))).filter(Boolean).map(summarizeJob);
-    const originParents = originParentIds.map((id) => byId.get(String(id))).filter(Boolean).map(summarizeJob);
     const pendingHours = pendingJobs.map((job) => job.waitHours);
     const elapsedHours = runningJobs.map((job) => job.elapsedHours);
     const partitionQueuePressure = [...new Set(pendingJobs.map((job) => job.partition).filter(Boolean))]
       .map((partition) => {
         const lane = byPartition.get(partition) || { pending: [], running: [] };
         const minPriority = Math.min(...pendingJobs.filter((job) => job.partition === partition).map((job) => Number(job.priority) || 0));
-        const aheadJobs = lane.pending.filter((job) =>
-          flowIdentity(job) !== group.flowKey &&
-          (Number(job.priority) || 0) > minPriority
-        );
+        const aheadJobs = lane.pending.filter((job) => flowIdentity(job) !== group.flowKey && (Number(job.priority) || 0) > minPriority);
         const servicePool = lane.running.length ? lane.running : annotatedJobs.filter((job) => job.isRunning);
         const drainSliceSeconds = mean(servicePool.map(estimateDrainSliceSeconds));
         const topFlows = countAheadFlows(aheadJobs);
@@ -447,11 +606,7 @@ function buildFlowGroups(annotatedJobs) {
       .filter((pressure) => pressure.aheadJobs > 0)
       .sort((a, b) => b.aheadJobs - a.aheadJobs || b.drainSeconds - a.drainSeconds);
     const combinedAheadIds = uniq(partitionQueuePressure.flatMap((pressure) => pressure.aheadJobIds));
-    const combinedTopFlows = countAheadFlows(
-      combinedAheadIds
-        .map((jobId) => byId.get(String(jobId)))
-        .filter(Boolean)
-    );
+    const combinedTopFlows = countAheadFlows(combinedAheadIds.map((jobId) => byId.get(String(jobId))).filter(Boolean));
     const externalQueuePressure = {
       partition: partitionQueuePressure.length === 1 ? partitionQueuePressure[0].partition : "",
       aheadJobs: combinedAheadIds.length,
@@ -471,7 +626,7 @@ function buildFlowGroups(annotatedJobs) {
           partition: partitionPressure?.partition || job.partition || "",
         };
       });
-    return {
+    const materialized = {
       flowKey: group.flowKey,
       label: group.label,
       wckey: group.wckey,
@@ -485,37 +640,248 @@ function buildFlowGroups(annotatedJobs) {
       avgElapsedHours: avg(elapsedHours),
       reasonMix: reasonMixFor(pendingJobs.length ? pendingJobs : jobs),
       blockerIds,
-      blockers,
       blockerSource: pendingJobs.find((job) => job.blockerSource && job.blockerSource !== "none")?.blockerSource || "none",
       originParentIds,
-      originParents,
       jobIds: group.jobIds,
       pendingJobIds: group.pendingJobIds,
       runningJobIds: group.runningJobIds,
       externalQueuePressure,
-      partitionQueuePressure,
       parentQueuePressure,
       users: [...group.users].sort(),
       accounts: [...group.accounts].sort(),
       partitions: [...group.partitions].sort(),
     };
+    materialized.searchText = groupSummarySearchText(materialized);
+    return materialized;
   }).sort(byCount);
+}
+
+export function buildDiagnosticsArtifact(jobs, opts = {}) {
+  const builtAt = opts.builtAt || Math.floor(Date.now() / 1000);
+  const annotatedJobs = annotateJobs(jobs);
+  const jobsById = new Map(annotatedJobs.map((job) => [String(job.jobId), job]));
+  const flowGroups = buildFlowGroups(annotatedJobs);
+  const controlGroups = flowGroups.filter((group) => isControlPlaneGroup(group));
+  const controlFlowKeys = new Set(controlGroups.map((group) => group.flowKey));
+  const indexedJobs = annotatedJobs.map((job) => ({ ...job, isControlPlane: controlFlowKeys.has(job.flowKey || `job:${job.jobId}`) }));
+  const indexedById = new Map(indexedJobs.map((job) => [String(job.jobId), job]));
+
+  const standardGroups = flowGroups.filter((group) => !controlFlowKeys.has(group.flowKey));
+  const logjamGroups = standardGroups
+    .filter((group) => group.runningCount > 0 && group.pendingCount > 0)
+    .sort((a, b) => b.pendingCount - a.pendingCount || b.maxWaitHours - a.maxWaitHours);
+
+  const pendingGroups = standardGroups
+    .filter((group) => group.pendingCount > 0)
+    .sort((a, b) => b.maxWaitHours - a.maxWaitHours || b.pendingCount - a.pendingCount);
+  const runningGroups = standardGroups
+    .filter((group) => group.runningCount > 0)
+    .sort((a, b) => b.runningCount - a.runningCount || b.maxElapsedHours - a.maxElapsedHours);
+
+  const graph = {
+    all: flowGroups.map((group) => serializeGroupArtifact(group, indexedById)),
+    logjams: logjamGroups.map((group) => serializeLogjamArtifact(group, indexedById)),
+    control: controlGroups.map((group) => serializeGroupArtifact(group, indexedById)),
+    pending: pendingGroups.map((group) => serializeGroupArtifact(group, indexedById)),
+    running: runningGroups.map((group) => serializeGroupArtifact(group, indexedById)),
+  };
+
+  const pendingJobs = indexedJobs.filter((job) => job.isPending && !job.isControlPlane);
+  const runningJobs = indexedJobs.filter((job) => job.isRunning && !job.isControlPlane);
+  const controlJobs = indexedJobs.filter((job) => job.isControlPlane);
+
+  const summary = diagnosticsSummary(indexedJobs, flowGroups, logjamGroups, controlGroups);
+  const details = {
+    control: {
+      count: controlJobs.length,
+      groupedFlows: controlGroups.length,
+      maxWaitHours: controlJobs.length ? Math.max(...controlJobs.map((job) => job.waitHours)) : 0,
+      maxElapsedHours: controlJobs.length ? Math.max(...controlJobs.map((job) => job.elapsedHours)) : 0,
+    },
+    pending: pageSummary(graph.pending, pendingJobs, "pending"),
+    running: pageSummary(graph.running, runningJobs, "running"),
+  };
+  const filters = {
+    wckeys: uniq(indexedJobs.map((job) => job.wckey)).sort(),
+    users: uniq(indexedJobs.map((job) => job.user)).sort(),
+    accounts: uniq(indexedJobs.map((job) => job.account)).sort(),
+    partitions: uniq(indexedJobs.map((job) => job.partition)).sort(),
+  };
+
+  return {
+    version: DIAGNOSTICS_ARTIFACT_VERSION,
+    builtAt,
+    summary,
+    details,
+    filters,
+    graph,
+    jobs: { items: indexedJobs },
+  };
+}
+
+export async function getOrBuildDiagnosticsArtifact({ db, cluster, snapshot, jobs, loadJobs }) {
+  const resolveJobs = async () => {
+    if (Array.isArray(jobs)) return jobs;
+    if (typeof loadJobs === "function") return loadJobs();
+    return [];
+  };
+
+  if (!snapshot?.id) return buildDiagnosticsArtifact(await resolveJobs());
+  const cacheKey = toArtifactCacheKey(cluster, snapshot.id, DIAGNOSTICS_ARTIFACT_VERSION);
+  const hot = getHotArtifact(cacheKey);
+  if (hot) return hot;
+
+  const persisted = readDiagnosticsCache(db, cluster);
+  if (persisted
+    && Number(persisted.snapshot_id) === Number(snapshot.id)
+    && String(persisted.version) === String(DIAGNOSTICS_ARTIFACT_VERSION)
+  ) {
+    const artifact = hydrateArtifactFromRow(persisted);
+    if (artifact) {
+      setHotArtifact(cacheKey, artifact);
+      return artifact;
+    }
+  }
+
+  if (inflightArtifacts.has(cacheKey)) return inflightArtifacts.get(cacheKey);
+  const building = Promise.resolve().then(() => {
+    return resolveJobs().then((sourceJobs) => buildDiagnosticsArtifact(sourceJobs));
+  }).then((artifact) => {
+    writeDiagnosticsCache(db, {
+      cluster,
+      snapshotId: Number(snapshot.id),
+      version: artifact.version,
+      builtAt: artifact.builtAt,
+      summaryJson: JSON.stringify(artifact.summary),
+      graphJson: JSON.stringify(artifact.graph),
+      jobsJson: JSON.stringify(artifact.jobs),
+    });
+    setHotArtifact(cacheKey, artifact);
+    return artifact;
+  }).finally(() => inflightArtifacts.delete(cacheKey));
+  inflightArtifacts.set(cacheKey, building);
+  return building;
+}
+
+export function renderDiagnosticsResponse(artifact, options = {}) {
+  const section = options.section || "summary";
+  const view = options.view || "graph";
+  const searchTerm = String(options.search || "").trim().toLowerCase();
+  const jobLimit = clampInt(options.jobLimit, DEFAULT_JOB_LIMIT, MAX_JOB_LIMIT);
+  const jobOffset = clampInt(options.jobOffset, 0, 1000000);
+  const sampleLimit = clampInt(options.sampleLimit, DEFAULT_GRAPH_SAMPLE_LIMIT, INTERNAL_GRAPH_SAMPLE_LIMIT);
+
+  const jobs = artifact.jobs?.items || [];
+  const jobsById = new Map(jobs.map((job) => [String(job.jobId), job]));
+  const matchedJobIds = searchTerm
+    ? new Set(jobs.filter((job) => matchesJobSearch(job, searchTerm)).map((job) => String(job.jobId)))
+    : null;
+  const groupMatches = (group) => matchesGroupSearch(group, searchTerm, matchedJobIds);
+
+  if (section === "summary") return { summary: artifact.summary };
+
+  if (section === "logjams") {
+    const filtered = (artifact.graph?.logjams || []).filter(groupMatches);
+    return {
+      summary: artifact.summary,
+      data: {
+        kind: "groups",
+        total: filtered.length,
+        shown: filtered.length,
+        limit: null,
+        items: filtered.map((group) => toPublicLogjam(group, sampleLimit)),
+      },
+    };
+  }
+
+  if (section === "control") {
+    const filtered = (artifact.graph?.control || []).filter(groupMatches);
+    const flowKeys = new Set(filtered.map((group) => group.flowKey));
+    const detailJobs = jobs.filter((job) => job.isControlPlane && flowKeys.has(job.flowKey || `job:${job.jobId}`));
+    const details = searchTerm ? {
+      count: detailJobs.length,
+      groupedFlows: filtered.length,
+      maxWaitHours: detailJobs.length ? Math.max(...detailJobs.map((job) => job.waitHours)) : 0,
+      maxElapsedHours: detailJobs.length ? Math.max(...detailJobs.map((job) => job.elapsedHours)) : 0,
+    } : (artifact.details?.control || {
+      count: detailJobs.length,
+      groupedFlows: filtered.length,
+      maxWaitHours: 0,
+      maxElapsedHours: 0,
+    });
+    return {
+      summary: artifact.summary,
+      details,
+      data: {
+        kind: "groups",
+        total: filtered.length,
+        shown: filtered.length,
+        limit: null,
+        items: filtered.map((group) => toPublicGroup(group, { mode: "control", sampleLimit })),
+      },
+    };
+  }
+
+  if (section === "pending" || section === "running") {
+    const mode = section;
+    const graphGroups = mode === "pending" ? (artifact.graph?.pending || []) : (artifact.graph?.running || []);
+    const filteredGroups = graphGroups.filter(groupMatches);
+    const filteredJobs = jobs.filter((job) =>
+      !job.isControlPlane &&
+      (mode === "pending" ? job.isPending : job.isRunning) &&
+      matchesJobSearch(job, searchTerm)
+    );
+    const details = pageSummary(filteredGroups, filteredJobs, mode);
+
+    if (view === "list") {
+      const sortedJobs = [...filteredJobs].sort(mode === "pending" ? byPendingAge : byElapsedAge);
+      return {
+        summary: artifact.summary,
+        details,
+        data: {
+          kind: "jobs",
+          total: sortedJobs.length,
+          offset: jobOffset,
+          limit: jobLimit,
+          items: sortedJobs.slice(jobOffset, jobOffset + jobLimit).map((job) => detailedJob(job, jobsById)),
+        },
+      };
+    }
+
+    return {
+      summary: artifact.summary,
+      details,
+      data: {
+        kind: "groups",
+        total: filteredGroups.length,
+        shown: filteredGroups.length,
+        limit: null,
+        items: filteredGroups.map((group) => toPublicGroup(group, { mode, sampleLimit })),
+      },
+    };
+  }
+
+  return buildDiagnosticsDataset(jobs);
+}
+
+export function buildDiagnosticsView(jobs, options = {}) {
+  const artifact = buildDiagnosticsArtifact(jobs);
+  return renderDiagnosticsResponse(artifact, options);
 }
 
 // Fan-out logjam: running parents with pending jobs in the same flow.
 export function detectFanoutLogjam(jobs) {
-  const flowGroups = buildFlowGroups(annotateJobs(jobs));
-  return flowGroups
-    .filter((group) => group.runningCount > 0 && group.pendingCount > 0)
+  const artifact = buildDiagnosticsArtifact(jobs);
+  return (artifact.graph?.logjams || [])
     .map((group) => ({
       type: "fanout_logjam",
       flowKey: group.flowKey,
       parentJobId: group.runningJobIds[0],
       parentJobIds: group.runningJobIds,
       originParentIds: group.originParentIds,
-      blockedChildren: group.pendingCount,
+      blockedChildren: group.blockedChildren,
       reasonMix: group.reasonMix,
-      message: `Flow ${group.label} has ${group.runningCount} active parent run(s) with ${group.pendingCount} pending child job(s).`,
+      message: group.message,
       childJobIds: group.pendingJobIds,
       blockers: group.blockers,
       originParents: group.originParents,
@@ -525,163 +891,47 @@ export function detectFanoutLogjam(jobs) {
 }
 
 export function buildDiagnosticsDataset(jobs) {
-  const annotatedJobs = annotateJobs(jobs);
-  const jobsById = new Map(annotatedJobs.map((job) => [String(job.jobId), job]));
-  const flowGroups = buildFlowGroups(annotatedJobs);
-  const pendingJobs = annotatedJobs.filter((job) => job.isPending);
-  const runningJobs = annotatedJobs.filter((job) => job.isRunning);
-  const logjams = flowGroups
-    .filter((group) => group.runningCount > 0 && group.pendingCount > 0)
-    .map((group) => ({
-      ...group,
-      blockedChildren: group.pendingCount,
-      runningParents: group.runningJobIds.map((id) => jobsById.get(String(id))).filter(Boolean).map(summarizeJob),
-      childJobIds: [...group.pendingJobIds],
-      message: `Flow ${group.label} is split between running parents and pending children.`,
-    }))
-    .sort((a, b) => b.blockedChildren - a.blockedChildren || b.maxWaitHours - a.maxWaitHours);
-
+  const artifact = buildDiagnosticsArtifact(jobs);
+  const pendingJobs = artifact.jobs.items.filter((job) => job.isPending && !job.isControlPlane);
+  const runningJobs = artifact.jobs.items.filter((job) => job.isRunning && !job.isControlPlane);
+  const logjamItems = (artifact.graph.logjams || []).map((group) => toPublicLogjam(group, INTERNAL_GRAPH_SAMPLE_LIMIT));
   return {
-    summary: {
-      totalJobs: annotatedJobs.length,
-      pendingCount: pendingJobs.length,
-      runningCount: runningJobs.length,
-      logjamCount: logjams.length,
-      uniqueFlows: flowGroups.length,
-      controlPlaneFlows: flowGroups.filter((group) => isControlPlaneGroup(group)).length,
-    },
-    jobs: annotatedJobs,
-    flows: flowGroups,
+    summary: artifact.summary,
+    jobs: artifact.jobs.items,
+    flows: (artifact.graph.all || []).map((group) => ({
+      ...toPublicGroup(group, INTERNAL_GRAPH_SAMPLE_LIMIT),
+      blockerIds: group.blockerIds,
+      originParentIds: group.originParentIds,
+      pendingJobIds: group.pendingJobIds,
+      runningJobIds: group.runningJobIds,
+    })),
     logjams: {
       summary: {
-        count: logjams.length,
-        blockedChildren: logjams.reduce((sum, item) => sum + item.blockedChildren, 0),
+        count: logjamItems.length,
+        blockedChildren: logjamItems.reduce((sum, item) => sum + (item.blockedChildren || 0), 0),
       },
-      items: logjams,
+      items: logjamItems,
     },
     pending: {
-      summary: {
-        count: pendingJobs.length,
-        maxWaitHours: pendingJobs.length ? Math.max(...pendingJobs.map((job) => job.waitHours)) : 0,
-        avgWaitHours: avg(pendingJobs.map((job) => job.waitHours)),
-        groupedFlows: flowGroups.filter((group) => group.pendingCount > 0).length,
-      },
-      groups: flowGroups.filter((group) => group.pendingCount > 0).sort((a, b) => b.maxWaitHours - a.maxWaitHours || b.pendingCount - a.pendingCount),
+      summary: pageSummary(artifact.graph.pending || [], pendingJobs, "pending"),
+      groups: (artifact.graph.pending || []).map((group) => ({
+        ...toPublicGroup(group, INTERNAL_GRAPH_SAMPLE_LIMIT),
+        blockerIds: group.blockerIds,
+        originParentIds: group.originParentIds,
+        pendingJobIds: group.pendingJobIds,
+        runningJobIds: group.runningJobIds,
+      })),
     },
     running: {
-      summary: {
-        count: runningJobs.length,
-        maxElapsedHours: runningJobs.length ? Math.max(...runningJobs.map((job) => job.elapsedHours)) : 0,
-        avgElapsedHours: avg(runningJobs.map((job) => job.elapsedHours)),
-        groupedFlows: flowGroups.filter((group) => group.runningCount > 0).length,
-      },
-      groups: flowGroups.filter((group) => group.runningCount > 0).sort((a, b) => b.runningCount - a.runningCount || b.maxElapsedHours - a.maxElapsedHours),
+      summary: pageSummary(artifact.graph.running || [], runningJobs, "running"),
+      groups: (artifact.graph.running || []).map((group) => ({
+        ...toPublicGroup(group, INTERNAL_GRAPH_SAMPLE_LIMIT),
+        blockerIds: group.blockerIds,
+        originParentIds: group.originParentIds,
+        pendingJobIds: group.pendingJobIds,
+        runningJobIds: group.runningJobIds,
+      })),
     },
-    filters: {
-      wckeys: uniq(annotatedJobs.map((job) => job.wckey)).sort(),
-      users: uniq(annotatedJobs.map((job) => job.user)).sort(),
-      accounts: uniq(annotatedJobs.map((job) => job.account)).sort(),
-      partitions: uniq(annotatedJobs.map((job) => job.partition)).sort(),
-    },
+    filters: artifact.filters,
   };
-}
-
-export function buildDiagnosticsView(jobs, options = {}) {
-  const section = options.section || "summary";
-  const view = options.view || "graph";
-  const searchTerm = String(options.search || "").trim().toLowerCase();
-  const jobLimit = clampInt(options.jobLimit, DEFAULT_JOB_LIMIT, 500);
-  const jobOffset = clampInt(options.jobOffset, 0, 1000000);
-  const sampleLimit = clampInt(options.sampleLimit, DEFAULT_GRAPH_SAMPLE_LIMIT, 20);
-
-  const annotatedJobs = annotateJobs(jobs);
-  const jobsById = new Map(annotatedJobs.map((job) => [String(job.jobId), job]));
-  const flowGroups = buildFlowGroups(annotatedJobs);
-  const controlGroups = flowGroups.filter((group) => isControlPlaneGroup(group));
-  const standardGroups = flowGroups.filter((group) => !isControlPlaneGroup(group));
-  const logjamGroups = standardGroups
-    .filter((group) => group.runningCount > 0 && group.pendingCount > 0)
-    .sort((a, b) => b.pendingCount - a.pendingCount || b.maxWaitHours - a.maxWaitHours);
-  const summary = diagnosticsSummary(annotatedJobs, flowGroups, logjamGroups);
-
-  if (section === "summary") return { summary };
-
-  if (section === "logjams") {
-    const filtered = logjamGroups.filter((group) => matchesGroupSearch(group, searchTerm, jobsById));
-    return {
-      summary,
-      data: {
-        kind: "groups",
-        total: filtered.length,
-        shown: filtered.length,
-        limit: null,
-        items: filtered.map((group) => serializeLogjam(group, jobsById, sampleLimit)),
-      },
-    };
-  }
-
-  if (section === "control") {
-    const filtered = controlGroups.filter((group) => matchesGroupSearch(group, searchTerm, jobsById));
-    const controlFlowKeys = new Set(controlGroups.map((group) => group.flowKey));
-    const controlJobs = annotatedJobs.filter((job) => controlFlowKeys.has(job.flowKey || `job:${job.jobId}`));
-    return {
-      summary,
-      details: {
-        count: controlJobs.length,
-        groupedFlows: filtered.length,
-        maxWaitHours: controlJobs.length ? Math.max(...controlJobs.map((job) => job.waitHours)) : 0,
-        maxElapsedHours: controlJobs.length ? Math.max(...controlJobs.map((job) => job.elapsedHours)) : 0,
-      },
-      data: {
-        kind: "groups",
-        total: filtered.length,
-        shown: filtered.length,
-        limit: null,
-        items: filtered.map((group) => serializeGroup(group, jobsById, sampleLimit)),
-      },
-    };
-  }
-
-  if (section === "pending" || section === "running") {
-    const mode = section;
-    const visibleGroups = standardGroups;
-    const visibleFlowKeys = new Set(visibleGroups.map((group) => group.flowKey));
-    const groupFilter = (group) => mode === "pending" ? group.pendingCount > 0 : group.runningCount > 0;
-    const jobFilter = (job) => mode === "pending" ? job.isPending : job.isRunning;
-    const filteredGroups = visibleGroups.filter((group) => groupFilter(group) && matchesGroupSearch(group, searchTerm, jobsById));
-    const filteredJobs = annotatedJobs.filter((job) =>
-      visibleFlowKeys.has(job.flowKey || `job:${job.jobId}`) &&
-      jobFilter(job) &&
-      matchesJobSearch(job, searchTerm)
-    );
-    const details = pageSummary(filteredGroups, filteredJobs, mode);
-
-    if (view === "list") {
-      return {
-        summary,
-        details,
-        data: {
-          kind: "jobs",
-          total: filteredJobs.length,
-          offset: jobOffset,
-          limit: jobLimit,
-          items: filteredJobs.slice(jobOffset, jobOffset + jobLimit).map((job) => detailedJob(job, jobsById)),
-        },
-      };
-    }
-
-    return {
-      summary,
-      details,
-      data: {
-        kind: "groups",
-        total: filteredGroups.length,
-        shown: filteredGroups.length,
-        limit: null,
-        items: filteredGroups.map((group) => serializeGroup(group, jobsById, sampleLimit)),
-      },
-    };
-  }
-
-  return buildDiagnosticsDataset(jobs);
 }

@@ -19,6 +19,14 @@ function compactLabels(items = [], limit = 3) {
   return `${labels.slice(0, limit).join(", ")} +${labels.length - limit}`;
 }
 
+function compactSampleLabels(items = [], totalCount = 0, limit = 3) {
+  const labels = items.filter(Boolean);
+  const shown = labels.slice(0, limit);
+  if (shown.length === 0) return totalCount ? `${totalCount} total` : "";
+  const remainder = Math.max(0, totalCount - shown.length);
+  return remainder ? `${shown.join(", ")} +${remainder} more` : shown.join(", ");
+}
+
 function tokenizeFlow(group) {
   if (group.isControlPlane) return ["control-plane", "slurm", "jenkins"];
   const values = [group.wckey || "", group.workdirRoot || "", group.label || ""];
@@ -119,12 +127,14 @@ function buildGraphModel(mode, group) {
 
   if (mode === "logjam") {
     const pressure = group.externalQueuePressure;
+    const originParentCount = group.originParentCount ?? (group.originParents || []).length;
+    const runningParentCount = group.runningParentCount ?? (group.runningParents || []).length;
     const originNode = makeNode({
       title: "Origin Runs",
-      subtitle: compactLabels((group.originParents || []).map((item) => item.jobId)),
+      subtitle: compactSampleLabels((group.originParents || []).map((item) => item.jobId), originParentCount),
       tone: "origin",
       badges: [
-        `${(group.originParents || []).length} parent run${(group.originParents || []).length === 1 ? "" : "s"}`,
+        `${originParentCount} parent run${originParentCount === 1 ? "" : "s"}`,
         pressure?.aheadJobs ? `${pressure.aheadJobs} ext ahead` : null,
       ].filter(Boolean),
       items: summarizeJobs(group.originParents || []),
@@ -141,7 +151,9 @@ function buildGraphModel(mode, group) {
     });
     const runningNode = makeNode({
       title: "Active Runners",
-      subtitle: pressure?.aheadJobs ? `${compactLabels((group.runningParents || []).map((item) => item.jobId))} · ~${fmtDrainHours(pressure.drainHours)} est drain` : compactLabels((group.runningParents || []).map((item) => item.jobId)),
+      subtitle: pressure?.aheadJobs
+        ? `${compactSampleLabels((group.runningParents || []).map((item) => item.jobId), runningParentCount)} · ~${fmtDrainHours(pressure.drainHours)} est drain`
+        : compactSampleLabels((group.runningParents || []).map((item) => item.jobId), runningParentCount),
       tone: "running",
       badges: [`${group.runningCount || 0} running`, pressure?.aheadJobs ? `${pressure.aheadJobs} ahead` : null].filter(Boolean),
       items: summarizeJobs(group.runningParents || []),
@@ -154,11 +166,12 @@ function buildGraphModel(mode, group) {
 
   if (mode === "pending") {
     const blockers = group.blockers?.length ? group.blockers : group.originParents || [];
+    const blockerCount = group.blockerCount ?? blockers.length;
     const blockerNode = makeNode({
       title: "Parent Blockers",
-      subtitle: compactLabels(blockers.map((item) => item.jobId)),
+      subtitle: compactSampleLabels(blockers.map((item) => item.jobId), blockerCount),
       tone: "origin",
-      badges: [`${blockers.length} upstream blocker${blockers.length === 1 ? "" : "s"}`],
+      badges: [`${blockerCount} upstream blocker${blockerCount === 1 ? "" : "s"}`],
       items: summarizeJobs(blockers),
     });
     const queueNode = makeNode({
@@ -175,11 +188,12 @@ function buildGraphModel(mode, group) {
   }
 
   if (mode === "control") {
+    const originParentCount = group.originParentCount ?? (group.originParents || []).length;
     const controlParents = makeNode({
       title: "Control Roots",
-      subtitle: compactLabels((group.originParents || []).map((item) => item.jobId)) || "Scheduler and orchestration roots",
+      subtitle: compactSampleLabels((group.originParents || []).map((item) => item.jobId), originParentCount) || "Scheduler and orchestration roots",
       tone: "origin",
-      badges: [`${(group.originParents || []).length} root process${(group.originParents || []).length === 1 ? "" : "es"}`],
+      badges: [`${originParentCount} root process${originParentCount === 1 ? "" : "es"}`],
       items: summarizeJobs(group.originParents || group.runningJobs || []),
     });
     const controlRunners = makeNode({
@@ -203,9 +217,13 @@ function buildGraphModel(mode, group) {
 
   const originNode = makeNode({
     title: "Origin Parents",
-    subtitle: compactLabels((group.originParents || []).map((item) => item.jobId)),
+    subtitle: compactSampleLabels((group.originParents || []).map((item) => item.jobId), group.originParentCount ?? (group.originParents || []).length),
     tone: "origin",
-    badges: [`${(group.originParents || []).length} traced parent${(group.originParents || []).length === 1 ? "" : "s"}`],
+    badges: [
+      `${group.originParentCount ?? (group.originParents || []).length} traced parent${
+        (group.originParentCount ?? (group.originParents || []).length) === 1 ? "" : "s"
+      }`,
+    ],
     items: summarizeJobs(group.originParents || []),
   });
   const runningNode = makeNode({
