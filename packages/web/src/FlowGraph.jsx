@@ -1,8 +1,11 @@
-import React, { useState } from "react";
+import React, { useLayoutEffect, useRef, useState } from "react";
 import { hierarchy, tree } from "d3";
+import { createPortal } from "react-dom";
 
 const NODE_WIDTH = 230;
 const NODE_HEIGHT = 112;
+const TOOLTIP_OFFSET = 16;
+const TOOLTIP_MARGIN = 12;
 const STOP_TAGS = new Set([
   "scratch", "nfs", "teams", "share", "builds", "build", "common", "archived", "archived-builds",
   "workspace", "workspaces", "slurm", "slurm_out", "internal", "sifive", "jobs", "monitor",
@@ -244,9 +247,32 @@ function linkPath(source, target) {
   return `M ${sx} ${sy} C ${cx} ${sy}, ${cx} ${ty}, ${tx} ${ty}`;
 }
 
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
 export function FlowGraph({ mode, group }) {
   const [tooltip, setTooltip] = useState(null);
+  const [tooltipFrame, setTooltipFrame] = useState({ left: 0, top: 0, placement: "below" });
+  const tooltipRef = useRef(null);
   const graph = layoutGraph(buildGraphModel(mode, group));
+
+  useLayoutEffect(() => {
+    if (!tooltip || !tooltipRef.current || typeof window === "undefined") return;
+    const rect = tooltipRef.current.getBoundingClientRect();
+    const maxLeft = Math.max(TOOLTIP_MARGIN, window.innerWidth - rect.width - TOOLTIP_MARGIN);
+    const left = clamp(tooltip.x + TOOLTIP_OFFSET, TOOLTIP_MARGIN, maxLeft);
+    const fitsBelow = tooltip.y + TOOLTIP_OFFSET + rect.height + TOOLTIP_MARGIN <= window.innerHeight;
+    const top = fitsBelow
+      ? tooltip.y + TOOLTIP_OFFSET
+      : Math.max(TOOLTIP_MARGIN, tooltip.y - rect.height - TOOLTIP_OFFSET);
+    const placement = fitsBelow ? "below" : "above";
+    setTooltipFrame((current) => (
+      current.left === left && current.top === top && current.placement === placement
+        ? current
+        : { left, top, placement }
+    ));
+  }, [tooltip]);
 
   return (
     <div className="flow-tree-shell">
@@ -282,8 +308,13 @@ export function FlowGraph({ mode, group }) {
           ))}
         </g>
       </svg>
-      {tooltip ? (
-        <div className="flow-tree-tooltip" style={{ left: tooltip.x + 16, top: tooltip.y + 16 }}>
+      {tooltip && typeof document !== "undefined" ? createPortal(
+        <div
+          ref={tooltipRef}
+          className="flow-tree-tooltip"
+          data-placement={tooltipFrame.placement}
+          style={{ left: tooltipFrame.left, top: tooltipFrame.top }}
+        >
           <strong>{tooltip.node.title}</strong>
           <div className="flow-tree-tooltip-subtitle">{tooltip.node.subtitle}</div>
           {tooltip.node.tags?.length ? (
@@ -303,7 +334,8 @@ export function FlowGraph({ mode, group }) {
           ) : (
             <div className="flow-tree-tooltip-subtitle">Hover cells are grouped. This node is intentionally collapsed.</div>
           )}
-        </div>
+        </div>,
+        document.body
       ) : null}
     </div>
   );
