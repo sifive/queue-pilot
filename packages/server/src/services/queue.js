@@ -48,8 +48,7 @@ export function summarizePressureJobs(jobs, cluster) {
   return { cluster, pendingCount: pending.length, runningCount: running.length, accounts, partitions };
 }
 
-export function summarizeBlockedRunners(artifact) {
-  const jobs = artifact?.jobs?.items || [];
+export function summarizeBlockedRunnerJobs(jobs = []) {
   const byId = new Map(jobs.map((job) => [String(job.jobId), job]));
   const byAccountFlow = new Map();
   const ensureScope = (account, flowKey) => {
@@ -104,6 +103,11 @@ export function summarizeBlockedRunners(artifact) {
   }
 
   return Object.fromEntries([...byAccount.entries()].map(([account, stats]) => [account, stats]));
+}
+
+export function summarizeBlockedRunners(artifact) {
+  if (artifact?.summary?.blockedRunnersByAccount) return artifact.summary.blockedRunnersByAccount;
+  return summarizeBlockedRunnerJobs(artifact?.jobs?.items || []);
 }
 
 export async function pressureSummary(adapter, cluster) {

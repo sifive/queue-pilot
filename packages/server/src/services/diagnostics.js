@@ -1,5 +1,6 @@
 import { classifyReason } from "@queuepilot/shared";
 import { readDiagnosticsCache, writeDiagnosticsCache } from "../db.js";
+import { summarizeBlockedRunnerJobs } from "./queue.js";
 
 const PENDING_RE = /^(PD|PENDING)/i;
 const RUNNING_RE = /^(R|RUNNING)/i;
@@ -14,7 +15,9 @@ const DEFAULT_DRAIN_SLICE_SECONDS = 1800;
 const MAX_DRAIN_SLICE_SECONDS = 4 * 3600;
 
 const HOT_ARTIFACT_LIMIT = 8;
-export const DIAGNOSTICS_ARTIFACT_VERSION = "4";
+const DEFAULT_MAX_PERSISTED_GRAPH_JSON_CHARS = 20_000_000;
+const DEFAULT_MAX_PERSISTED_JOBS_JSON_CHARS = 20_000_000;
+export const DIAGNOSTICS_ARTIFACT_VERSION = "6";
 
 const hotArtifacts = new Map();
 const inflightArtifacts = new Map();
@@ -173,7 +176,7 @@ function detailedJob(job, jobsById) {
     flowKey: job.flowKey,
     workdir: job.workdir,
     workdirRoot: job.workdirRoot,
-    workdirHref: job.workdirHref,
+    workdirHref: job.workdir ? `file://${encodeURI(job.workdir)}` : "",
     waitHours: job.waitHours,
     elapsedHours: job.elapsedHours,
     blockerIds: job.blockerIds,
@@ -285,6 +288,184 @@ function serializeGroupArtifact(group, jobsById) {
     pendingJobIds: [...group.pendingJobIds],
     runningJobIds: [...group.runningJobIds],
   };
+}
+
+function compactArtifactJob(job) {
+  return {
+    jobId: job.jobId,
+    name: job.name,
+    state: job.state,
+    user: job.user,
+    account: job.account,
+    partition: job.partition,
+    reason: job.reason,
+    category: job.category,
+    explain: job.explain,
+    wckey: job.wckey,
+    flowKey: job.flowKey,
+    workdir: job.workdir,
+    workdirRoot: job.workdirRoot,
+    waitHours: job.waitHours,
+    elapsedHours: job.elapsedHours,
+    blockerIds: job.blockerIds,
+    blockerSource: job.blockerSource,
+    originParentIds: job.originParentIds,
+    isPending: job.isPending,
+    isRunning: job.isRunning,
+    isControlPlane: job.isControlPlane,
+    searchText: job.searchText,
+  };
+}
+
+function emptyPersistedJobsPayload(total = 0) {
+  return { items: [], total, truncated: true };
+}
+
+function hasUsableArtifactJobs(artifact) {
+  return Array.isArray(artifact?.jobs?.items) && !artifact?.jobs?.truncated;
+}
+
+function persistedSummaryPayload(artifact) {
+  return {
+    summary: artifact.summary || {},
+    details: artifact.details || {},
+    filters: artifact.filters || {},
+  };
+}
+
+function compactPersistedGroup(group) {
+  return {
+    flowKey: group.flowKey,
+    label: group.label,
+    wckey: group.wckey,
+    workdirRoot: group.workdirRoot,
+    jobCount: group.jobCount,
+    pendingCount: group.pendingCount,
+    runningCount: group.runningCount,
+    maxWaitHours: group.maxWaitHours,
+    avgWaitHours: group.avgWaitHours,
+    maxElapsedHours: group.maxElapsedHours,
+    avgElapsedHours: group.avgElapsedHours,
+    reasonMix: group.reasonMix,
+    blockerSource: group.blockerSource,
+    blockerCount: group.blockerCount,
+    originParentCount: group.originParentCount,
+    blockers: group.blockers,
+    originParents: group.originParents,
+    pendingJobs: group.pendingJobs,
+    runningJobs: group.runningJobs,
+    userLabel: group.userLabel,
+    accountLabel: group.accountLabel,
+    partitionLabel: group.partitionLabel,
+    isControlPlane: group.isControlPlane,
+    searchText: group.searchText,
+  };
+}
+
+function compactPersistedLogjam(group) {
+  return {
+    flowKey: group.flowKey,
+    label: group.label,
+    wckey: group.wckey,
+    workdirRoot: group.workdirRoot,
+    blockedChildren: group.blockedChildren,
+    runningCount: group.runningCount,
+    accountLabel: group.accountLabel,
+    maxWaitHours: group.maxWaitHours,
+    maxElapsedHours: group.maxElapsedHours,
+    reasonMix: group.reasonMix,
+    blockerCount: group.blockerCount,
+    originParentCount: group.originParentCount,
+    runningParentCount: group.runningParentCount,
+    accountScopes: group.accountScopes || [],
+    originParents: group.originParents,
+    runningParents: group.runningParents,
+    children: group.children,
+    externalQueuePressure: group.externalQueuePressure,
+    message: group.message,
+    isControlPlane: group.isControlPlane,
+    searchText: group.searchText,
+  };
+}
+
+function compactPersistedGraph(graph = {}, { includeSearchText = true, includeAll = true } = {}) {
+  const normalizeGroups = (groups = []) => groups.map((group) => {
+    const compact = compactPersistedGroup(group);
+    if (!includeSearchText) delete compact.searchText;
+    return compact;
+  });
+  const normalizeLogjams = (groups = []) => groups.map((group) => {
+    const compact = compactPersistedLogjam(group);
+    if (!includeSearchText) delete compact.searchText;
+    return compact;
+  });
+  return {
+    all: includeAll ? normalizeGroups(graph.all) : [],
+    logjams: normalizeLogjams(graph.logjams),
+    control: normalizeGroups(graph.control),
+    pending: normalizeGroups(graph.pending),
+    running: normalizeGroups(graph.running),
+    truncated: false,
+  };
+}
+
+function emptyPersistedGraphPayload() {
+  return {
+    all: [],
+    logjams: [],
+    control: [],
+    pending: [],
+    running: [],
+    truncated: true,
+  };
+}
+
+function hasUsableArtifactGraph(artifact) {
+  return Array.isArray(artifact?.graph?.logjams)
+    && Array.isArray(artifact?.graph?.pending)
+    && Array.isArray(artifact?.graph?.running)
+    && !artifact?.graph?.truncated;
+}
+
+function hasSearchableArtifactGraph(artifact) {
+  if (!hasUsableArtifactGraph(artifact)) return false;
+  const sections = ["all", "logjams", "control", "pending", "running"];
+  return sections.every((section) => {
+    const groups = artifact?.graph?.[section];
+    return !Array.isArray(groups) || groups.length === 0 || Array.isArray(groups[0]?.jobIds);
+  });
+}
+
+function serializeJobsForCache(jobsPayload, maxChars = DEFAULT_MAX_PERSISTED_JOBS_JSON_CHARS) {
+  try {
+    const json = JSON.stringify(jobsPayload);
+    if (json.length <= maxChars) return json;
+    return JSON.stringify(emptyPersistedJobsPayload(jobsPayload?.total || jobsPayload?.items?.length || 0));
+  } catch (error) {
+    if (error instanceof RangeError) {
+      return JSON.stringify(emptyPersistedJobsPayload(jobsPayload?.total || jobsPayload?.items?.length || 0));
+    }
+    throw error;
+  }
+}
+
+function serializeGraphForCache(graphPayload, maxChars = DEFAULT_MAX_PERSISTED_GRAPH_JSON_CHARS) {
+  const attempts = [
+    compactPersistedGraph(graphPayload, { includeAll: true, includeSearchText: true }),
+    compactPersistedGraph(graphPayload, { includeAll: false, includeSearchText: true }),
+    compactPersistedGraph(graphPayload, { includeAll: false, includeSearchText: false }),
+  ];
+
+  for (const payload of attempts) {
+    try {
+      const json = JSON.stringify(payload);
+      if (json.length <= maxChars) return json;
+    } catch (error) {
+      if (!(error instanceof RangeError)) throw error;
+    }
+  }
+
+  return JSON.stringify(emptyPersistedGraphPayload());
 }
 
 function serializeLogjamArtifact(group, jobsById) {
@@ -510,10 +691,13 @@ function setHotArtifact(cacheKey, artifact) {
 
 function hydrateArtifactFromRow(row) {
   try {
+    const summaryPayload = JSON.parse(row.summary_json || "{}");
     return {
       version: String(row.version),
       builtAt: Number(row.built_at) || Math.floor(Date.now() / 1000),
-      summary: JSON.parse(row.summary_json || "{}"),
+      summary: summaryPayload.summary || summaryPayload,
+      details: summaryPayload.details || {},
+      filters: summaryPayload.filters || {},
       graph: JSON.parse(row.graph_json || "{}"),
       jobs: JSON.parse(row.jobs_json || "{}"),
     };
@@ -790,6 +974,7 @@ export function buildDiagnosticsArtifact(jobs, opts = {}) {
   const controlJobs = indexedJobs.filter((job) => job.isControlPlane);
 
   const summary = diagnosticsSummary(indexedJobs, flowGroups, logjamGroups, controlGroups);
+  summary.blockedRunnersByAccount = summarizeBlockedRunnerJobs(indexedJobs);
   const details = {
     control: {
       count: controlJobs.length,
@@ -806,6 +991,7 @@ export function buildDiagnosticsArtifact(jobs, opts = {}) {
     accounts: uniq(indexedJobs.map((job) => job.account)).sort(),
     partitions: uniq(indexedJobs.map((job) => job.partition)).sort(),
   };
+  const jobIndex = indexedJobs.map(compactArtifactJob);
 
   return {
     version: DIAGNOSTICS_ARTIFACT_VERSION,
@@ -814,11 +1000,22 @@ export function buildDiagnosticsArtifact(jobs, opts = {}) {
     details,
     filters,
     graph,
-    jobs: { items: indexedJobs },
+    jobs: { items: jobIndex, total: jobIndex.length, truncated: false },
   };
 }
 
-export async function getOrBuildDiagnosticsArtifact({ db, cluster, snapshot, jobs, loadJobs }) {
+export async function getOrBuildDiagnosticsArtifact({
+  db,
+  cluster,
+  snapshot,
+  jobs,
+  loadJobs,
+  requireJobs = false,
+  requireGraph = false,
+  requireSearchableGraph = false,
+  maxPersistedGraphJsonChars = DEFAULT_MAX_PERSISTED_GRAPH_JSON_CHARS,
+  maxPersistedJobsJsonChars = DEFAULT_MAX_PERSISTED_JOBS_JSON_CHARS,
+}) {
   const resolveJobs = async () => {
     if (Array.isArray(jobs)) return jobs;
     if (typeof loadJobs === "function") return loadJobs();
@@ -828,7 +1025,11 @@ export async function getOrBuildDiagnosticsArtifact({ db, cluster, snapshot, job
   if (!snapshot?.id) return buildDiagnosticsArtifact(await resolveJobs());
   const cacheKey = toArtifactCacheKey(cluster, snapshot.id, DIAGNOSTICS_ARTIFACT_VERSION);
   const hot = getHotArtifact(cacheKey);
-  if (hot) return hot;
+  if (hot
+    && (!requireJobs || hasUsableArtifactJobs(hot))
+    && (!requireGraph || hasUsableArtifactGraph(hot))
+    && (!requireSearchableGraph || hasSearchableArtifactGraph(hot))
+  ) return hot;
 
   const persisted = readDiagnosticsCache(db, cluster);
   if (persisted
@@ -836,7 +1037,11 @@ export async function getOrBuildDiagnosticsArtifact({ db, cluster, snapshot, job
     && String(persisted.version) === String(DIAGNOSTICS_ARTIFACT_VERSION)
   ) {
     const artifact = hydrateArtifactFromRow(persisted);
-    if (artifact) {
+    if (artifact
+      && (!requireJobs || hasUsableArtifactJobs(artifact))
+      && (!requireGraph || hasUsableArtifactGraph(artifact))
+      && (!requireSearchableGraph || hasSearchableArtifactGraph(artifact))
+    ) {
       setHotArtifact(cacheKey, artifact);
       return artifact;
     }
@@ -851,9 +1056,9 @@ export async function getOrBuildDiagnosticsArtifact({ db, cluster, snapshot, job
       snapshotId: Number(snapshot.id),
       version: artifact.version,
       builtAt: artifact.builtAt,
-      summaryJson: JSON.stringify(artifact.summary),
-      graphJson: JSON.stringify(artifact.graph),
-      jobsJson: JSON.stringify(artifact.jobs),
+      summaryJson: JSON.stringify(persistedSummaryPayload(artifact)),
+      graphJson: serializeGraphForCache(artifact.graph, maxPersistedGraphJsonChars),
+      jobsJson: serializeJobsForCache(artifact.jobs, maxPersistedJobsJsonChars),
     });
     setHotArtifact(cacheKey, artifact);
     return artifact;
@@ -930,7 +1135,9 @@ export function renderDiagnosticsResponse(artifact, options = {}) {
       (mode === "pending" ? job.isPending : job.isRunning) &&
       matchesJobSearch(job, searchTerm)
     );
-    const details = pageSummary(filteredGroups, filteredJobs, mode);
+    const details = searchTerm
+      ? pageSummary(filteredGroups, filteredJobs, mode)
+      : (artifact.details?.[mode] || pageSummary(filteredGroups, filteredJobs, mode));
 
     if (view === "list") {
       const sortedJobs = [...filteredJobs].sort(mode === "pending" ? byPendingAge : byElapsedAge);
@@ -1033,4 +1240,9 @@ export function buildDiagnosticsDataset(jobs) {
     },
     filters: artifact.filters,
   };
+}
+
+export function resetDiagnosticsArtifactCacheForTest() {
+  hotArtifacts.clear();
+  inflightArtifacts.clear();
 }

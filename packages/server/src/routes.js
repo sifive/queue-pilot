@@ -97,8 +97,17 @@ export function registerRoutes(app, ctx) {
   app.get("/api/diagnose", async (req, reply) => {
     const cluster = cl(req.query);
     const snapshot = latestSnapshotInfo(db, cluster);
+    const section = req.query.section || "summary";
+    const view = req.query.view || "graph";
+    const hasSearch = Boolean(String(req.query.search || "").trim());
+    const hasPrefilters = Boolean(req.query.user || req.query.wckey || req.query.workdir);
+    const requireGraph = section !== "summary";
+    const requireSearchableGraph = requireGraph && hasSearch;
+    const requireJobs = hasSearch
+      || hasPrefilters
+      || ((section === "pending" || section === "running") && view === "list");
     const query = {
-      section: req.query.section || "summary",
+      section,
       view: req.query.view,
       search: req.query.search,
       jobLimit: req.query.jobLimit,
@@ -112,10 +121,12 @@ export function registerRoutes(app, ctx) {
         cluster,
         snapshot,
         loadJobs: () => snapshotJobsById(db, snapshot.id),
+        requireGraph,
+        requireSearchableGraph,
+        requireJobs,
       })
       : buildDiagnosticsArtifact(await adapter.listJobs({ cluster, states: "PD,R" }));
     let artifact = baseArtifact;
-    const hasPrefilters = Boolean(req.query.user || req.query.wckey || req.query.workdir);
     if (hasPrefilters) {
       const filteredJobs = (baseArtifact.jobs?.items || []).filter((job) => {
         if (req.query.user && job.user !== req.query.user) return false;

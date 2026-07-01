@@ -35,3 +35,17 @@ test("blocked runner summary counts blocked parent runs per account", async () =
   assert.deepEqual(byAccount.verif_performance, { blockedRunners: 0, totalParentRunners: 2 });
   assert.deepEqual(byAccount.verif_tools, { blockedRunners: 0, totalParentRunners: 1 });
 });
+
+test("blocked runner summary falls back to the compact summary map when jobs are not persisted", async () => {
+  const adapter = new MockAdapter();
+  const jobs = await adapter.listJobs({ states: "PD,R" });
+  const artifact = buildDiagnosticsArtifact(jobs);
+  const expected = artifact.summary.blockedRunnersByAccount;
+
+  const truncatedArtifact = {
+    ...artifact,
+    jobs: { items: [], total: artifact.jobs.total, truncated: true },
+  };
+
+  assert.deepEqual(summarizeBlockedRunners(truncatedArtifact), expected);
+});

@@ -11,6 +11,7 @@ import {
   diagnoseJob,
   getOrBuildDiagnosticsArtifact,
   parseDependencyIds,
+  resetDiagnosticsArtifactCacheForTest,
 } from "../src/services/diagnostics.js";
 
 function openDiagnosticsCacheDb() {
@@ -232,4 +233,50 @@ test("snapshot-keyed diagnostics artifact cache persists and invalidates by snap
   assert.equal(artifactNewSnapshot.summary.totalJobs, 0);
   const updatedRow = db.prepare("SELECT snapshot_id FROM diagnostics_cache WHERE cluster='compute1'").get();
   assert.equal(updatedRow.snapshot_id, 102);
+});
+
+test("diagnostics cache can persist a truncated jobs index and rebuild full jobs when required", async () => {
+  const adapter = new MockAdapter();
+  const jobs = await adapter.listJobs({ states: "PD,R" });
+  const db = openDiagnosticsCacheDb();
+
+  const artifact = await getOrBuildDiagnosticsArtifact({
+    db,
+    cluster: "compute1",
+    snapshot: { id: 201 },
+    jobs,
+    maxPersistedJobsJsonChars: 12,
+  });
+  assert.equal(artifact.jobs.truncated, false);
+
+  const cachedRow = db.prepare("SELECT jobs_json FROM diagnostics_cache WHERE cluster='compute1'").get();
+  const persistedJobs = JSON.parse(cachedRow.jobs_json);
+  assert.equal(persistedJobs.truncated, true);
+  assert.equal(persistedJobs.items.length, 0);
+  assert.equal(persistedJobs.total, jobs.length);
+
+  resetDiagnosticsArtifactCacheForTest();
+  const summaryArtifact = await getOrBuildDiagnosticsArtifact({
+    db,
+    cluster: "compute1",
+    snapshot: { id: 201 },
+    jobs: [],
+  });
+  assert.equal(summaryArtifact.jobs.truncated, true);
+  assert.equal(summaryArtifact.summary.totalJobs, jobs.length);
+  assert.equal(summaryArtifact.details.pending.count, artifact.details.pending.count);
+  assert.equal(summaryArtifact.graph.pending.length, artifact.graph.pending.length);
+
+  resetDiagnosticsArtifactCacheForTest();
+  const rebuiltArtifact = await getOrBuildDiagnosticsArtifact({
+    db,
+    cluster: "compute1",
+    snapshot: { id: 201 },
+    loadJobs: () => jobs,
+    requireJobs: true,
+    maxPersistedJobsJsonChars: 12,
+  });
+  assert.equal(rebuiltArtifact.jobs.truncated, false);
+  assert.equal(rebuiltArtifact.jobs.items.length, jobs.length);
+  assert.equal(rebuiltArtifact.summary.totalJobs, jobs.length);
 });
