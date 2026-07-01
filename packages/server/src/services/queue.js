@@ -48,6 +48,64 @@ export function summarizePressureJobs(jobs, cluster) {
   return { cluster, pendingCount: pending.length, runningCount: running.length, accounts, partitions };
 }
 
+export function summarizeBlockedRunners(artifact) {
+  const jobs = artifact?.jobs?.items || [];
+  const byId = new Map(jobs.map((job) => [String(job.jobId), job]));
+  const byAccountFlow = new Map();
+  const ensureScope = (account, flowKey) => {
+    const key = `${account || ""}::${flowKey || ""}`;
+    if (!byAccountFlow.has(key)) {
+      byAccountFlow.set(key, {
+        account: account || "",
+        flowKey: flowKey || "",
+        pendingJobIds: new Set(),
+        runningJobIds: new Set(),
+        originParentIds: new Set(),
+      });
+    }
+    return byAccountFlow.get(key);
+  };
+
+  for (const job of jobs) {
+    const account = job.account || "";
+    const flowKey = job.flowKey || `job:${job.jobId}`;
+    const scope = ensureScope(account, flowKey);
+    if (job.isPending) scope.pendingJobIds.add(String(job.jobId));
+    if (job.isRunning) scope.runningJobIds.add(String(job.jobId));
+    for (const originParentId of job.originParentIds || []) {
+      const originParent = byId.get(String(originParentId));
+      if (!originParent) continue;
+      if ((originParent.account || "") !== account) continue;
+      if (!originParent.isRunning) continue;
+      scope.originParentIds.add(String(originParentId));
+    }
+  }
+
+  const byAccount = new Map();
+  const ensureAccount = (account) => {
+    if (!byAccount.has(account)) {
+      byAccount.set(account, {
+        blockedRunners: 0,
+        totalParentRunners: 0,
+      });
+    }
+    return byAccount.get(account);
+  };
+
+  for (const scope of byAccountFlow.values()) {
+    const runningParentIds = [...scope.originParentIds];
+    const runningJobIds = [...scope.runningJobIds];
+    const activeDispatchedRunnerIds = runningJobIds.filter((jobId) => !scope.originParentIds.has(String(jobId)));
+    const account = ensureAccount(scope.account);
+    account.totalParentRunners += runningParentIds.length;
+    if (scope.pendingJobIds.size > 0 && runningParentIds.length > 0 && activeDispatchedRunnerIds.length === 0) {
+      account.blockedRunners += runningParentIds.length;
+    }
+  }
+
+  return Object.fromEntries([...byAccount.entries()].map(([account, stats]) => [account, stats]));
+}
+
 export async function pressureSummary(adapter, cluster) {
   const jobs = await adapter.listJobs({ cluster, states: "PD,R" });
   return summarizePressureJobs(jobs, cluster);

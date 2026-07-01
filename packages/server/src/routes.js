@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { config } from "./config.js";
 import { latestSnapshotInfo, latestSnapshotJobs, snapshotJobsById } from "./db.js";
-import { bucketize, summarizePressureJobs } from "./services/queue.js";
+import { bucketize, summarizeBlockedRunners, summarizePressureJobs } from "./services/queue.js";
 import {
   buildDiagnosticsArtifact,
   diagnoseJob,
@@ -59,7 +59,20 @@ export function registerRoutes(app, ctx) {
   app.get("/api/pressure", async (req) => {
     const cluster = cl(req.query);
     const { snapshot, jobs } = await currentJobs(cluster);
-    return { snapshotTakenAt: snapshot?.taken_at || Math.floor(Date.now() / 1000), ...summarizePressureJobs(jobs, cluster) };
+    const base = summarizePressureJobs(jobs, cluster);
+    const artifact = snapshot?.id
+      ? await getOrBuildDiagnosticsArtifact({ db, cluster, snapshot, jobs })
+      : buildDiagnosticsArtifact(jobs);
+    const blockedRunnerByAccount = summarizeBlockedRunners(artifact);
+    return {
+      snapshotTakenAt: snapshot?.taken_at || Math.floor(Date.now() / 1000),
+      ...base,
+      accounts: base.accounts.map((account) => ({
+        ...account,
+        blockedRunners: blockedRunnerByAccount[account.account]?.blockedRunners || 0,
+        totalParentRunners: blockedRunnerByAccount[account.account]?.totalParentRunners || 0,
+      })),
+    };
   });
 
   app.get("/api/pending", async (req) => {

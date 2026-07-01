@@ -114,7 +114,7 @@ test("graph payloads are sampled with explicit count fields", async () => {
   assert.ok(group.children.length <= 8);
 });
 
-test("logjam view annotates external queue pressure from other flows", async () => {
+test("logjam view scopes external queue pressure to the same account", async () => {
   const adapter = new MockAdapter();
   const jobs = await adapter.listJobs({ states: "PD,R" });
   jobs.push(
@@ -123,7 +123,7 @@ test("logjam view annotates external queue pressure from other flows", async () 
       cluster: jobs[0].cluster,
       name: "other-flow-ahead-1",
       user: "jenkins-verif",
-      account: "verif_bulk",
+      account: "verif_performance",
       partition: "standard_scl",
       state: "PD",
       reason: "Priority",
@@ -143,7 +143,7 @@ test("logjam view annotates external queue pressure from other flows", async () 
       cluster: jobs[0].cluster,
       name: "other-flow-ahead-2",
       user: "jenkins-verif",
-      account: "verif_bulk",
+      account: "verif_performance",
       partition: "standard_scl",
       state: "PD",
       reason: "Priority",
@@ -157,18 +157,44 @@ test("logjam view annotates external queue pressure from other flows", async () 
       workdir: "/scratch/jenkins/archived-builds/other-flow-b/builds/run-b",
       nodelist: "",
       dependency: "",
+    },
+    {
+      jobId: "70000003",
+      cluster: jobs[0].cluster,
+      name: "other-account-ahead",
+      user: "jenkins-verif",
+      account: "verif_bulk",
+      partition: "standard_scl",
+      state: "PD",
+      reason: "Priority",
+      priority: 9500,
+      pendingSeconds: 1500,
+      elapsedSeconds: 0,
+      timelimitSeconds: 3600,
+      reqCpus: 1,
+      reqMem: "4G",
+      wckey: ":other-account-flow/",
+      workdir: "/scratch/jenkins/archived-builds/other-account-flow/builds/run-c",
+      nodelist: "",
+      dependency: "",
     }
   );
 
   const logjamView = buildDiagnosticsView(jobs, { section: "logjams", sampleLimit: 6 });
   const [logjam] = logjamView.data.items;
+  const [accountScope] = logjam.accountScopes;
 
-  assert.equal(logjam.externalQueuePressure.aheadJobs, 3);
-  assert.equal(logjam.externalQueuePressure.externalFlows, 3);
+  assert.equal(logjam.externalQueuePressure.account, "verif_performance");
+  assert.equal(logjam.externalQueuePressure.aheadJobs, 2);
+  assert.equal(logjam.externalQueuePressure.externalFlows, 2);
   assert.ok(logjam.externalQueuePressure.drainHours > 0);
   assert.ok(logjam.maxElapsedHours > 0);
-  assert.equal(logjam.runningParents[0].externalQueuePressure.aheadJobs, 3);
-  assert.match(logjam.message, /higher-priority job\(s\) from other flows ahead in queue/);
+  assert.equal(logjam.runningParents[0].externalQueuePressure.account, "verif_performance");
+  assert.equal(logjam.runningParents[0].externalQueuePressure.aheadJobs, 2);
+  assert.equal(accountScope.account, "verif_performance");
+  assert.equal(accountScope.externalQueuePressure.aheadJobs, 2);
+  assert.ok(accountScope.externalQueuePressure.topFlows.every((flow) => flow.account === "verif_performance"));
+  assert.match(logjam.message, /same-account/);
 });
 
 test("snapshot-keyed diagnostics artifact cache persists and invalidates by snapshot id", async () => {

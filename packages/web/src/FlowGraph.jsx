@@ -52,10 +52,18 @@ function fmtDrainHours(hours = 0) {
   return `${hours.toFixed(hours >= 10 ? 0 : 1)}h`;
 }
 
+function flowScopeLabel(flow) {
+  const parts = [];
+  if (flow.account) parts.push(flow.account);
+  if (flow.partitions?.length) parts.push(compactLabels(flow.partitions, 2));
+  else if (flow.partition) parts.push(flow.partition);
+  return parts.join(" / ");
+}
+
 function queuePressureSummary(queuePressure) {
-  if (!queuePressure?.aheadJobs) return "No other-flow queue pressure detected";
+  if (!queuePressure?.aheadJobs) return "No same-account queue pressure detected";
   const flowLabel = queuePressure.externalFlows ? ` across ${queuePressure.externalFlows} flow${queuePressure.externalFlows === 1 ? "" : "s"}` : "";
-  return `${queuePressure.aheadJobs} higher-priority job${queuePressure.aheadJobs === 1 ? "" : "s"} ahead${flowLabel}`;
+  return `${queuePressure.aheadJobs} higher-priority same-account job${queuePressure.aheadJobs === 1 ? "" : "s"} ahead${flowLabel}`;
 }
 
 function queuePressureBadges(queuePressure) {
@@ -146,7 +154,7 @@ function buildGraphModel(mode, group) {
       badges: queuePressureBadges(pressure),
       items: (pressure?.topFlows || []).map((flow) => ({
         label: flow.label,
-        meta: [`${flow.count} ahead`, flow.partition].filter(Boolean).join(" / "),
+        meta: [`${flow.count} ahead`, flowScopeLabel(flow)].filter(Boolean).join(" / "),
       })),
     });
     const runningNode = makeNode({

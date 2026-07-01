@@ -14,7 +14,7 @@ const DEFAULT_DRAIN_SLICE_SECONDS = 1800;
 const MAX_DRAIN_SLICE_SECONDS = 4 * 3600;
 
 const HOT_ARTIFACT_LIMIT = 8;
-export const DIAGNOSTICS_ARTIFACT_VERSION = "3";
+export const DIAGNOSTICS_ARTIFACT_VERSION = "4";
 
 const hotArtifacts = new Map();
 const inflightArtifacts = new Map();
@@ -57,33 +57,73 @@ function estimateDrainSliceSeconds(job) {
   return Math.max(900, Math.min(estimate, MAX_DRAIN_SLICE_SECONDS));
 }
 
+function queueLaneKey(partition = "", account = "") {
+  return `${partition || ""}::${account || ""}`;
+}
+
 function countAheadFlows(jobs = []) {
   const byFlow = new Map();
   for (const job of jobs) {
-    const key = flowIdentity(job);
+    const key = `${job.account || ""}::${flowIdentity(job)}`;
     if (!byFlow.has(key)) {
       byFlow.set(key, {
-        flowKey: key,
+        flowKey: flowIdentity(job),
         label: flowLabelForJob(job),
+        account: job.account || "",
         partition: job.partition || "",
+        partitions: job.partition ? [job.partition] : [],
         count: 0,
       });
     }
-    byFlow.get(key).count += 1;
+    const flow = byFlow.get(key);
+    flow.count += 1;
+    if (job.partition && !flow.partitions.includes(job.partition)) flow.partitions.push(job.partition);
   }
-  return [...byFlow.values()].sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+  return [...byFlow.values()]
+    .map((flow) => ({
+      ...flow,
+      partitions: [...flow.partitions].sort(),
+    }))
+    .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+}
+
+function combineQueuePressure(queuePressures, jobsById, extra = {}) {
+  const pressures = queuePressures.filter(Boolean);
+  const aheadJobIds = uniq(pressures.flatMap((pressure) => pressure.aheadJobIds || []));
+  const aheadJobs = aheadJobIds.map((jobId) => jobsById.get(String(jobId))).filter(Boolean);
+  const topFlows = countAheadFlows(aheadJobs);
+  return {
+    partition: pressures.length === 1 ? pressures[0].partition : (extra.partition || ""),
+    account: pressures.length === 1 ? pressures[0].account : (extra.account || ""),
+    aheadJobs: aheadJobIds.length,
+    aheadJobIds,
+    externalFlows: topFlows.length,
+    drainSeconds: pressures.length ? Math.max(...pressures.map((pressure) => pressure.drainSeconds || 0)) : 0,
+    topFlows,
+    partitions: uniq(pressures.map((pressure) => pressure.partition)).sort(),
+    accounts: uniq(pressures.map((pressure) => pressure.account)).sort(),
+  };
 }
 
 function summarizeQueuePressure(queuePressure) {
   if (!queuePressure) return null;
   return {
     partition: queuePressure.partition || "",
+    account: queuePressure.account || "",
     aheadJobs: queuePressure.aheadJobs || 0,
     externalFlows: queuePressure.externalFlows || 0,
     drainSeconds: queuePressure.drainSeconds || 0,
     drainHours: roundHours(queuePressure.drainSeconds || 0),
-    topFlows: (queuePressure.topFlows || []).slice(0, 4),
+    topFlows: (queuePressure.topFlows || []).slice(0, 4).map((flow) => ({
+      flowKey: flow.flowKey,
+      label: flow.label,
+      account: flow.account || "",
+      partition: flow.partition || "",
+      partitions: flow.partitions || [],
+      count: flow.count || 0,
+    })),
     partitions: queuePressure.partitions || [],
+    accounts: queuePressure.accounts || [],
   };
 }
 
@@ -250,8 +290,20 @@ function serializeGroupArtifact(group, jobsById) {
 function serializeLogjamArtifact(group, jobsById) {
   const parentQueuePressure = new Map((group.parentQueuePressure || []).map((pressure) => [String(pressure.jobId), pressure]));
   const compactParentPressure = (pressure) => ({
+    account: pressure?.account || "",
     aheadJobs: pressure?.aheadJobs || 0,
     drainHours: roundHours(pressure?.drainSeconds || 0),
+  });
+  const summarizeAccountScope = (scope) => ({
+    account: scope.account || "",
+    blockedChildren: scope.blockedChildren || 0,
+    runningCount: scope.runningCount || 0,
+    originParentCount: scope.originParentCount || 0,
+    runningParentCount: scope.runningParentCount || 0,
+    maxWaitHours: scope.maxWaitHours || 0,
+    maxElapsedHours: scope.maxElapsedHours || 0,
+    reasonMix: scope.reasonMix || {},
+    externalQueuePressure: summarizeQueuePressure(scope.externalQueuePressure),
   });
   const summarizeParentWithPressure = (jobId) => {
     const job = jobsById.get(String(jobId));
@@ -260,6 +312,8 @@ function serializeLogjamArtifact(group, jobsById) {
       jobId: job.jobId,
       name: job.name,
       state: job.state,
+      account: job.account || "",
+      partition: job.partition || "",
       externalQueuePressure: compactParentPressure(parentQueuePressure.get(String(jobId)) || group.externalQueuePressure),
     };
   };
@@ -270,18 +324,20 @@ function serializeLogjamArtifact(group, jobsById) {
     workdirRoot: group.workdirRoot,
     blockedChildren: group.pendingCount,
     runningCount: group.runningCount,
+    accountLabel: compactList(group.accounts),
     maxWaitHours: group.maxWaitHours,
     maxElapsedHours: group.maxElapsedHours,
     reasonMix: group.reasonMix,
     blockerCount: group.blockerIds.length,
     originParentCount: group.originParentIds.length,
     runningParentCount: group.runningJobIds.length,
+    accountScopes: (group.accountScopes || []).map(summarizeAccountScope),
     originParents: group.originParentIds.slice(0, INTERNAL_GRAPH_SAMPLE_LIMIT).map(summarizeParentWithPressure).filter(Boolean),
     runningParents: group.runningJobIds.slice(0, INTERNAL_GRAPH_SAMPLE_LIMIT).map(summarizeParentWithPressure).filter(Boolean),
     children: sampleJobsByIds(group.pendingJobIds, jobsById),
     externalQueuePressure: summarizeQueuePressure(group.externalQueuePressure),
     message: group.externalQueuePressure?.aheadJobs
-      ? `Flow ${group.label} has ${group.runningCount} active parent run(s), ${group.pendingCount} pending child job(s), and ${group.externalQueuePressure.aheadJobs} higher-priority job(s) from other flows ahead in queue.`
+      ? `Flow ${group.label} has ${group.runningCount} active parent run(s), ${group.pendingCount} pending child job(s), and ${group.externalQueuePressure.aheadJobs} higher-priority same-account job(s) from other flows ahead in queue.`
       : `Flow ${group.label} has ${group.runningCount} active parent run(s) with ${group.pendingCount} pending child job(s).`,
     isControlPlane: isControlPlaneGroup(group),
     searchText: group.searchText,
@@ -374,12 +430,24 @@ function toPublicLogjam(group, sampleLimit = DEFAULT_GRAPH_SAMPLE_LIMIT) {
     workdirRoot: group.workdirRoot,
     blockedChildren: group.blockedChildren,
     runningCount: group.runningCount,
+    accountLabel: group.accountLabel,
     maxWaitHours: group.maxWaitHours,
     maxElapsedHours: group.maxElapsedHours,
     reasonMix: group.reasonMix,
     blockerCount: group.blockerCount,
     originParentCount: group.originParentCount,
     runningParentCount: group.runningParentCount,
+    accountScopes: (group.accountScopes || []).map((scope) => ({
+      account: scope.account,
+      blockedChildren: scope.blockedChildren,
+      runningCount: scope.runningCount,
+      originParentCount: scope.originParentCount,
+      runningParentCount: scope.runningParentCount,
+      maxWaitHours: scope.maxWaitHours,
+      maxElapsedHours: scope.maxElapsedHours,
+      reasonMix: scope.reasonMix,
+      externalQueuePressure: scope.externalQueuePressure,
+    })),
     originParents: group.originParents.slice(0, sampleLimit),
     runningParents: group.runningParents.slice(0, sampleLimit),
     children: group.children.slice(0, sampleLimit),
@@ -545,7 +613,7 @@ export function annotateJobs(jobs) {
 function buildFlowGroups(annotatedJobs) {
   const byId = new Map(annotatedJobs.map((job) => [String(job.jobId), job]));
   const grouped = new Map();
-  const byPartition = new Map();
+  const byLane = new Map();
 
   for (const job of annotatedJobs) {
     const key = job.flowKey || `job:${job.jobId}`;
@@ -570,10 +638,16 @@ function buildFlowGroups(annotatedJobs) {
     if (job.user) group.users.add(job.user);
     if (job.account) group.accounts.add(job.account);
     if (job.partition) group.partitions.add(job.partition);
-    if (!byPartition.has(job.partition || "")) {
-      byPartition.set(job.partition || "", { pending: [], running: [] });
+    const laneKey = queueLaneKey(job.partition, job.account);
+    if (!byLane.has(laneKey)) {
+      byLane.set(laneKey, {
+        partition: job.partition || "",
+        account: job.account || "",
+        pending: [],
+        running: [],
+      });
     }
-    const lane = byPartition.get(job.partition || "");
+    const lane = byLane.get(laneKey);
     if (job.isPending) lane.pending.push(job);
     if (job.isRunning) lane.running.push(job);
   }
@@ -586,16 +660,19 @@ function buildFlowGroups(annotatedJobs) {
     const originParentIds = uniq(jobs.flatMap((job) => job.originParentIds));
     const pendingHours = pendingJobs.map((job) => job.waitHours);
     const elapsedHours = runningJobs.map((job) => job.elapsedHours);
-    const partitionQueuePressure = [...new Set(pendingJobs.map((job) => job.partition).filter(Boolean))]
-      .map((partition) => {
-        const lane = byPartition.get(partition) || { pending: [], running: [] };
-        const minPriority = Math.min(...pendingJobs.filter((job) => job.partition === partition).map((job) => Number(job.priority) || 0));
+    const pendingLaneKeys = [...new Set(pendingJobs.map((job) => queueLaneKey(job.partition, job.account)))];
+    const laneQueuePressure = pendingLaneKeys
+      .map((laneKey) => {
+        const lane = byLane.get(laneKey) || { partition: "", account: "", pending: [], running: [] };
+        const lanePending = pendingJobs.filter((job) => queueLaneKey(job.partition, job.account) === laneKey);
+        const minPriority = Math.min(...lanePending.map((job) => Number(job.priority) || 0));
         const aheadJobs = lane.pending.filter((job) => flowIdentity(job) !== group.flowKey && (Number(job.priority) || 0) > minPriority);
-        const servicePool = lane.running.length ? lane.running : annotatedJobs.filter((job) => job.isRunning);
+        const servicePool = lane.running;
         const drainSliceSeconds = mean(servicePool.map(estimateDrainSliceSeconds));
         const topFlows = countAheadFlows(aheadJobs);
         return {
-          partition,
+          partition: lane.partition,
+          account: lane.account,
           aheadJobs: aheadJobs.length,
           aheadJobIds: aheadJobs.map((job) => job.jobId),
           externalFlows: topFlows.length,
@@ -605,27 +682,46 @@ function buildFlowGroups(annotatedJobs) {
           topFlows,
         };
       })
-      .filter((pressure) => pressure.aheadJobs > 0)
       .sort((a, b) => b.aheadJobs - a.aheadJobs || b.drainSeconds - a.drainSeconds);
-    const combinedAheadIds = uniq(partitionQueuePressure.flatMap((pressure) => pressure.aheadJobIds));
-    const combinedTopFlows = countAheadFlows(combinedAheadIds.map((jobId) => byId.get(String(jobId))).filter(Boolean));
-    const externalQueuePressure = {
-      partition: partitionQueuePressure.length === 1 ? partitionQueuePressure[0].partition : "",
-      aheadJobs: combinedAheadIds.length,
-      externalFlows: combinedTopFlows.length,
-      drainSeconds: partitionQueuePressure.length ? Math.max(...partitionQueuePressure.map((pressure) => pressure.drainSeconds)) : 0,
-      topFlows: combinedTopFlows,
-      partitions: partitionQueuePressure.map((pressure) => pressure.partition),
-    };
+    const scopedAccounts = [...new Set(jobs.map((job) => job.account || ""))];
+    const accountScopes = scopedAccounts.map((account) => {
+      const accountPendingJobs = pendingJobs.filter((job) => (job.account || "") === account);
+      const accountRunningJobs = runningJobs.filter((job) => (job.account || "") === account);
+      const accountJobs = jobs.filter((job) => (job.account || "") === account);
+      const accountOriginParentIds = uniq(accountJobs.flatMap((job) => job.originParentIds))
+        .filter((jobId) => (byId.get(String(jobId))?.account || "") === account);
+      const accountPressures = laneQueuePressure.filter((pressure) => (pressure.account || "") === account);
+      return {
+        account,
+        blockedChildren: accountPendingJobs.length,
+        pendingCount: accountPendingJobs.length,
+        runningCount: accountRunningJobs.length,
+        originParentCount: accountOriginParentIds.length,
+        runningParentCount: accountRunningJobs.length,
+        maxWaitHours: accountPendingJobs.length ? Math.max(...accountPendingJobs.map((job) => job.waitHours)) : 0,
+        avgWaitHours: avg(accountPendingJobs.map((job) => job.waitHours)),
+        maxElapsedHours: accountRunningJobs.length ? Math.max(...accountRunningJobs.map((job) => job.elapsedHours)) : 0,
+        avgElapsedHours: avg(accountRunningJobs.map((job) => job.elapsedHours)),
+        reasonMix: reasonMixFor(accountPendingJobs.length ? accountPendingJobs : accountJobs),
+        partitions: uniq(jobs.filter((job) => (job.account || "") === account).map((job) => job.partition)).sort(),
+        externalQueuePressure: combineQueuePressure(accountPressures, byId, { account }),
+      };
+    }).sort((a, b) => b.blockedChildren - a.blockedChildren || b.maxWaitHours - a.maxWaitHours || a.account.localeCompare(b.account));
+    const externalQueuePressure = combineQueuePressure(laneQueuePressure, byId);
+    const accountPressureByAccount = new Map(accountScopes.map((scope) => [scope.account || "", scope.externalQueuePressure]));
+    const lanePressureByKey = new Map(laneQueuePressure.map((pressure) => [queueLaneKey(pressure.partition, pressure.account), pressure]));
     const parentQueuePressure = uniq([...originParentIds, ...group.runningJobIds])
       .map((jobId) => byId.get(String(jobId)))
       .filter(Boolean)
       .map((job) => {
-        const partitionPressure = partitionQueuePressure.find((pressure) => pressure.partition === job.partition);
+        const partitionPressure = lanePressureByKey.get(queueLaneKey(job.partition, job.account));
+        const accountPressure = accountPressureByAccount.get(job.account || "");
+        const queuePressure = partitionPressure || accountPressure || externalQueuePressure;
         return {
           jobId: job.jobId,
-          ...(partitionPressure || externalQueuePressure),
-          partition: partitionPressure?.partition || job.partition || "",
+          ...queuePressure,
+          partition: queuePressure.partition || job.partition || "",
+          account: queuePressure.account || job.account || "",
         };
       });
     const materialized = {
@@ -647,6 +743,7 @@ function buildFlowGroups(annotatedJobs) {
       jobIds: group.jobIds,
       pendingJobIds: group.pendingJobIds,
       runningJobIds: group.runningJobIds,
+      accountScopes,
       externalQueuePressure,
       parentQueuePressure,
       users: [...group.users].sort(),
